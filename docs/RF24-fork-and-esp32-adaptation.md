@@ -7,7 +7,7 @@ This project uses an **ESP32-adapted** version of the [nRF24/RF24](https://githu
 ## 1. Fork the original repo
 
 1. Go to [https://github.com/nRF24/RF24](https://github.com/nRF24/RF24) and click **Fork**. Create the fork under your GitHub account.
-2. Optionally rename the fork to **project-esp32-embedsyst-cpp_rf24**: **Settings → General → Repository name**. The clone URL will be `https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24`.
+2. Optionally rename the fork to **project-esp32-embedsyst-cpp_rf24.component**: **Settings → General → Repository name**. The clone URL will be `https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24.component`.
 
 ---
 
@@ -16,8 +16,8 @@ This project uses an **ESP32-adapted** version of the [nRF24/RF24](https://githu
 Clone your fork:
 
 ```bash
-git clone https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24
-cd project-esp32-embedsyst-cpp_rf24
+git clone https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24.component
+cd project-esp32-embedsyst-cpp_rf24.component
 ```
 
 From this jammer repo, copy the ESP-IDF–specific files into the clone:
@@ -67,7 +67,7 @@ After your fork is pushed:
 2. Add your fork as a submodule (recreates `components/RF24`):
 
    ```bash
-   git submodule add https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24 components/RF24
+   git submodule add https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24.component components/RF24
    ```
 
 3. Commit `.gitmodules` and the `components/RF24` submodule entry.

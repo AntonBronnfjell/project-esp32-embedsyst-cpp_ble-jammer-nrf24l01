@@ -31,7 +31,7 @@ If you already cloned without submodules:
 git submodule update --init --recursive
 ```
 
-RF24 driver: [ESP32-adapted fork](https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24).
+RF24 driver: [ESP32-adapted fork](https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24.component).
 
 ---
 

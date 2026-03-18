@@ -142,5 +142,5 @@ Replace `PORT` with your serial port (e.g. `/dev/tty.usbserial-*` or `COM3`). Af
 
 - [Capacitor placement for NRF24 modules](capacitor-placement.md)
 - [RF24 fork and ESP32 adaptation](RF24-fork-and-esp32-adaptation.md) — how this project uses an ESP32-adapted RF24 (fork + submodule)
-- [RF24 library](https://github.com/nRF24/RF24) (original); this project uses [AntonBronnfjell/project-esp32-embedsyst-cpp_rf24](https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24) (ESP32-adapted fork) as submodule
+- [RF24 library](https://github.com/nRF24/RF24) (original); this project uses [AntonBronnfjell/project-esp32-embedsyst-cpp_rf24.component](https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24.component) (ESP32-adapted fork) as submodule
 - [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/) (ESP32-S3)
