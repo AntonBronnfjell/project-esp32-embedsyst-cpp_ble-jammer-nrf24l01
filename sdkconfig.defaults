@@ -1,0 +1,4 @@
+# Enable BLE (NimBLE) so the ESP32-S3 built-in radio can be used as a third transmitter
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n

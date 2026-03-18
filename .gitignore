@@ -1,0 +1,20 @@
+# ESP-IDF build and config
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# System and IDE
+.DS_Store
+.idea/
+cmake-build-*/
+*.swp
+*.swo
+*~
+
+# Logs and local captures (optional)
+serial_monitor.log
+
+# Local fork clone (submodule lives in components/RF24)
+/RF24/

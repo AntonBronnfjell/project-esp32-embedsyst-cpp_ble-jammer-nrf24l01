@@ -1,0 +1,3 @@
+[submodule "components/RF24"]
+	path = components/RF24
+	url = https://github.com/AntonBronnfjell/project-esp32-embedsyst-cpp_rf24.git
