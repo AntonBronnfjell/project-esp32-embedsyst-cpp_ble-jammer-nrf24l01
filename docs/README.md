@@ -133,6 +133,7 @@ Replace `PORT` with your serial port (e.g. `/dev/tty.usbserial-*` or `COM3`). Af
 
 ## Troubleshooting
 
+- **`begin FAILED` / “No NRF24 modules” in the log:** Re-check wiring against the pin table and diagram above: **CE and CSN are different pins** (easy to swap), **MOSI and MISO are often swapped** (ESP MOSI → module MOSI, ESP MISO → module MISO), **common GND** between ESP32 and radios, and **3.3 V only** on module VCC (never 5 V). Continuity beeps help, but wrong pin order still fails SPI.
 - **No jamming:** Check 3.3 V at each module (≥ ~3.0 V), antennas connected, and serial output for “Module 1/2 OK”.
 - **Voltage sag:** Add a dedicated regulator or second supply, 100 µF caps per module, and lower resistance (thick/short wires, parallel jumpers).
 
