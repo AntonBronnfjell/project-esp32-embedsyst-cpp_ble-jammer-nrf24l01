@@ -134,6 +134,8 @@ Replace `PORT` with your serial port (e.g. `/dev/tty.usbserial-*` or `COM3`). Af
 ## Troubleshooting
 
 - **`begin FAILED` / “No NRF24 modules” in the log:** Re-check wiring against the pin table and diagram above: **CE and CSN are different pins** (easy to swap), **MOSI and MISO are often swapped** (ESP MOSI → module MOSI, ESP MISO → module MISO), **common GND** between ESP32 and radios, and **3.3 V only** on module VCC (never 5 V). Continuity beeps help, but wrong pin order still fails SPI.
+- **SPI probe lines (after a failed `begin()`):** The firmware prints raw reads of **SETUP_AW** and **CONFIG**. On a **powered, working** nRF24 after reset, **SETUP_AW** is often **0x03** and **CONFIG** often **0x08** (exact values can vary slightly). **0xFF** or **0x00** on both usually means **no real SPI response** (wrong SCK/MOSI/MISO/CSN, floating MISO, missing GND, or module not on 3.3 V). If the probe looks good but `begin()` still fails, try lowering **`JAMMER_NRF24_SPI_HZ`** in `main/jammer_main.cpp` (e.g. to `1000000`) and reflash.
+- **Confirm the module itself:** The only definitive check without this project is a **second setup** (e.g. Arduino + RF24 “GettingStarted” / scanner sketch) with **known-good** 3.3 V wiring. If it fails there too, suspect a bad module or power.
 - **No jamming:** Check 3.3 V at each module (≥ ~3.0 V), antennas connected, and serial output for “Module 1/2 OK”.
 - **Voltage sag:** Add a dedicated regulator or second supply, 100 µF caps per module, and lower resistance (thick/short wires, parallel jumpers).
 

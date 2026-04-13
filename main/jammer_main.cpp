@@ -19,21 +19,33 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
+#include "esp_wifi_types.h"
+#include "esp_event.h"
+#include "esp_netif.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
 #include "driver/rmt_encoder.h"
 #include "led_strip_encoder.h"
 #include "RF24.h"
+#include "nRF24L01.h"
 
-// NimBLE (C API) - built-in radio as third transmitter
-extern "C" {
-#include "host/ble_hs.h"
-#include "host/ble_store.h"
-#include "host/util/util.h"
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-#include "services/gap/ble_svc_gap.h"
-}
+// WiFi raw TX as 3rd wideband transmitter (20 MHz bandwidth >> nRF24's 2 MHz)
+static void init_wifi_jammer(void);
+static void wifi_jam_task(void* arg);
+
+// Beacon frame: 20 MHz wideband energy on the selected WiFi channel
+static const uint8_t s_beacon_frame[] = {
+    0x80, 0x00,                                     // Frame Control: Beacon
+    0x00, 0x00,                                     // Duration
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff,             // DA: Broadcast
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,             // SA
+    0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,             // BSSID
+    0x00, 0x00,                                     // Sequence
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Timestamp
+    0x64, 0x00,                                     // Beacon interval
+    0x31, 0x04,                                     // Capabilities
+    0x00, 0x01, 'X',                                // SSID (1 byte — minimal)
+};
 
 static const char* TAG = "JAMMER";
 
@@ -63,6 +75,9 @@ static const char* TAG = "JAMMER";
 // Last button press duration (ms), set by check_button_event; 0 if not a press
 static uint32_t s_last_press_duration_ms = 0;
 
+// Lower this (e.g. 1_000_000) if SPI probe shows garbage but wiring looks correct (long wires / breadboard).
+#define JAMMER_NRF24_SPI_HZ 10000000
+
 // ============== ESP32-S3 PIN CONFIGURATION ==============
 // NOTE: ESP32-S3 has NO GPIO 22, 23, 24, 25 (only 0-21 and 26-48).
 // Pins below are valid for ESP32-S3 and typical Lonely Binary N16R8 / DevKitC headers.
@@ -91,35 +106,41 @@ static uint32_t s_last_press_duration_ms = 0;
 #define RAINBOW_MS_FAST  18   // faster rainbow in cycle/sweep modes
 
 // ============== JAMMER CONFIGURATION ==============
-#define BLUETOOTH_CHANNEL_COUNT  79
-#define BLE_ADVERTISING_CHANNELS  3
-#define SWEEP_DELAY_MS            1
-#define MIN_CHANNEL                0
-#define MAX_CHANNEL               79
-
+#define MIN_CHANNEL   0
+#define MAX_CHANNEL  79
 // ============== GLOBAL VARIABLES ==============
-// ESP-IDF backend: two SPI instances (HSPI and VSPI)
-SPI spi0(SPI2_HOST);  // HSPI
-SPI spi1(SPI3_HOST);  // VSPI
+SPI spi0(SPI2_HOST);
+SPI spi1(SPI3_HOST);
 
 RF24 radio1(CE_PIN_1, CSN_PIN_1);
 RF24 radio2(CE_PIN_2, CSN_PIN_2);
 
+static uint32_t xor_state = 0xDEADBEEF;
+
+static inline uint32_t xorshift32(void) {
+    xor_state ^= xor_state << 13;
+    xor_state ^= xor_state >> 17;
+    xor_state ^= xor_state << 5;
+    return xor_state;
+}
+
+static inline uint8_t rand_channel(void) {
+    return (uint8_t)(xorshift32() % (MAX_CHANNEL + 1));
+}
+
 enum JammerMode {
-    MODE_BLUETOOTH_CLASSIC,
-    MODE_BLUETOOTH_BLE,
-    MODE_DUAL_SWEEP,
-    MODE_CONSTANT_CARRIER,
+    MODE_BARRAGE,           // random-hop packet flood, radios on different channels
+    MODE_BT_CLASSIC_SPLIT,  // radios sweep opposite halves (0-39 / 40-79)
+    MODE_BLE_ALL_DATA,      // hit all 40 BLE data+adv channels
+    MODE_CONSTANT_CARRIER,  // CW on ch 45 (baseline test)
     MODE_COUNT
 };
 
-static JammerMode currentMode = MODE_BLUETOOTH_CLASSIC;
-static uint8_t currentChannel = 45;
-static bool directionUp = true;
-static uint8_t dual_ch1 = 0;
-static uint8_t dual_ch2 = 40;
-static bool dual_dir1 = true;
-static bool dual_dir2 = true;
+static JammerMode currentMode = MODE_BARRAGE;
+static uint8_t sweep_ch1 = 0;
+static uint8_t sweep_ch2 = 40;
+static bool sweep_dir1 = true;
+static bool sweep_dir2 = true;
 
 // Jamming on/off: LED on when active, off when stopped. Button short-press toggles; long-press cycles mode.
 static volatile bool s_jamming_active = false;
@@ -134,20 +155,21 @@ static rmt_encoder_handle_t s_led_encoder = nullptr;
 
 // ============== FUNCTION PROTOTYPES ==============
 static void init_nrf24_modules(void);
-static void disable_esp_wifi_only(void);  // WiFi only; BLE stays on for 3rd transmitter
-static void init_ble_third_transmitter(void);
-static void set_channel_and_apply(RF24& radio, uint8_t channel);
-static void set_channel_sweep(RF24& radio, uint8_t& channel, bool& dir);
-static void set_constant_carrier(RF24& radio, uint8_t channel);
-/** Apply current mode once (use when turning jamming ON so RF starts immediately). */
+static void log_nrf24_spi_probe(const char* bus_name, SPI& spi);
+static void configure_radio_for_tx(RF24& radio);
+static void hop_carrier(RF24& radio, uint8_t channel);
+static void jam_barrage(void);
+static void jam_bt_classic_split(void);
+static void jam_ble_all_data(void);
+static void jam_constant_carrier(void);
 static void apply_jamming_mode_once(void);
 static void print_mode(void);
 static void switch_mode(void);
-/** 0 = no event, 1 = short press (toggle jamming), 2 = long press (cycle mode) */
 static int check_button_event(void);
 static void stop_jamming_radios(void);
 static void init_rgb_led(void);
 static void rainbow_led_task(void* arg);
+static void jam_task(void* arg);
 
 // ============== ENTRY POINT ==============
 extern "C" void app_main(void)
@@ -163,11 +185,8 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    LOG_INIT("Disabling WiFi (BLE kept for 3rd TX)...");
-    disable_esp_wifi_only();
-
-    LOG_INIT("BLE (3rd transmitter)...");
-    init_ble_third_transmitter();
+    LOG_INIT("WiFi raw TX (3rd transmitter, 20 MHz wideband)...");
+    init_wifi_jammer();
 
     LOG_INIT("Button GPIO %d (short=toggle jam, long=cycle mode)", BUTTON_PIN);
     gpio_config_t io = {};
@@ -188,7 +207,8 @@ extern "C" void app_main(void)
     LOG_INIT("Setup complete. Short-press = start/stop jamming. Long-press = change mode.");
     print_mode();
 
-    static uint32_t s_jam_status_ticks = 0;
+    xTaskCreatePinnedToCore(jam_task, "jam", 4096, NULL, configMAX_PRIORITIES - 1, NULL, 1);
+
     while (1) {
         int ev = check_button_event();
         if (ev == 1) {
@@ -198,14 +218,11 @@ extern "C" void app_main(void)
                 LOG_JAM("Powering up radios...");
                 radio1.powerUp();
                 radio2.powerUp();
-                vTaskDelay(pdMS_TO_TICKS(8));   // Tpd2stby ~5ms
+                vTaskDelay(pdMS_TO_TICKS(10));
                 apply_jamming_mode_once();
-                vTaskDelay(pdMS_TO_TICKS(15));  // PLL/PA settle
-                bool r1 = radio1.isChipConnected();
-                bool r2 = radio2.isChipConnected();
-                uint8_t ch1 = radio1.getChannel(), ch2 = radio2.getChannel();
-                LOG_JAM("ON | R1=%s R2=%s | ch=%d (R1:%d R2:%d)", r1 ? "ok" : "FAIL", r2 ? "ok" : "FAIL", (int)currentChannel, (int)ch1, (int)ch2);
-                s_jam_status_ticks = 0;
+                LOG_JAM("ON | R1=%s R2=%s",
+                        radio1.isChipConnected() ? "ok" : "FAIL",
+                        radio2.isChipConnected() ? "ok" : "FAIL");
             } else {
                 stop_jamming_radios();
                 LOG_JAM_OFF("OFF (radios in power-down)");
@@ -214,49 +231,7 @@ extern "C" void app_main(void)
             LOG_BTN("Long press (%u ms) -> cycle mode", (unsigned)s_last_press_duration_ms);
             switch_mode();
         }
-
-        if (s_jamming_active && (++s_jam_status_ticks >= 1500)) {  // ~15 s
-            s_jam_status_ticks = 0;
-            LOG_JAM("Status: active | mode=%d ch=%d R1=%s R2=%s", (int)currentMode, (int)currentChannel,
-                    radio1.isChipConnected() ? "ok" : "FAIL", radio2.isChipConnected() ? "ok" : "FAIL");
-        }
-
-        if (s_jamming_active) {
-            switch (currentMode) {
-                case MODE_BLUETOOTH_CLASSIC:
-                    set_channel_sweep(radio1, currentChannel, directionUp);
-                    set_channel_sweep(radio2, currentChannel, directionUp);
-                    vTaskDelay(pdMS_TO_TICKS(SWEEP_DELAY_MS));
-                    break;
-
-                case MODE_BLUETOOTH_BLE: {
-                    const uint8_t bleChannels[] = { 2, 26, 80 };
-                    for (int i = 0; i < 3; i++) {
-                        set_channel_and_apply(radio1, bleChannels[i]);
-                        set_channel_and_apply(radio2, bleChannels[i]);
-                        vTaskDelay(pdMS_TO_TICKS(2));
-                    }
-                    break;
-                }
-
-                case MODE_DUAL_SWEEP:
-                    set_channel_sweep(radio1, dual_ch1, dual_dir1);
-                    set_channel_sweep(radio2, dual_ch2, dual_dir2);
-                    vTaskDelay(pdMS_TO_TICKS(SWEEP_DELAY_MS));
-                    break;
-
-                case MODE_CONSTANT_CARRIER:
-                    set_constant_carrier(radio1, 45);
-                    set_constant_carrier(radio2, 45);
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    break;
-
-                default:
-                    break;
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));  /* yield so IDLE can run and task WDT is fed */
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -354,7 +329,6 @@ static void rainbow_led_task(void* arg)
             vTaskDelay(pdMS_TO_TICKS(RAINBOW_MS_SLOW));
             continue;
         }
-        // Slow rainbow for constant carrier, faster for cycle/sweep modes
         uint32_t delay_ms = (currentMode == MODE_CONSTANT_CARRIER) ? RAINBOW_MS_SLOW : RAINBOW_MS_FAST;
         uint8_t r, g, b;
         hsv_to_rgb(hue % 360, sat, val, &r, &g, &b);
@@ -364,109 +338,73 @@ static void rainbow_led_task(void* arg)
     }
 }
 
-static void disable_esp_wifi_only(void)
+// ---------- WiFi raw TX: 3rd transmitter using ESP32's built-in 2.4 GHz radio ----------
+// Each WiFi channel is 20 MHz wide — covers ~20 Bluetooth channels at once.
+// WiFi ch 1 = 2412 MHz (BT ch 12), ch 6 = 2437 MHz (BT ch 37), ch 11 = 2462 MHz (BT ch 62)
+
+static void init_wifi_jammer(void)
 {
-    // Only disable WiFi so the built-in BLE can run as third transmitter
-    esp_err_t err = esp_wifi_stop();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
-        LOG_WRN("esp_wifi_stop: %s", esp_err_to_name(err));
-    }
-    err = esp_wifi_deinit();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
-        LOG_WRN("esp_wifi_deinit: %s", esp_err_to_name(err));
-    }
-    LOG_INIT("WiFi disabled (BLE kept for 3rd transmitter)");
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
+    esp_wifi_set_max_tx_power(80);
+
+    xTaskCreatePinnedToCore(wifi_jam_task, "wifi_jam", 4096, NULL, 5, NULL, 0);
+    LOG_INIT("WiFi raw TX started (3rd transmitter, built-in antenna)");
 }
 
-// ---------- BLE third transmitter (NimBLE non-connectable advertising) ----------
-static void ble_on_sync(void);
-static void ble_on_reset(int reason);
-static void nimble_host_task(void* param);
-
-static void start_ble_advertising(void)
+static void wifi_jam_task(void* arg)
 {
-    uint8_t own_addr_type;
-    int rc = ble_hs_util_ensure_addr(0);
-    if (rc != 0) {
-        LOG_ERR("BLE ensure addr failed: %d", rc);
-        return;
+    (void)arg;
+    static const uint8_t wifi_channels[] = { 1, 6, 11 };
+    uint8_t ch_idx = 0;
+    uint32_t pkt_count = 0;
+
+    for (;;) {
+        if (!s_jamming_active) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        esp_wifi_80211_tx(WIFI_IF_STA, s_beacon_frame, sizeof(s_beacon_frame), false);
+
+        if (++pkt_count >= 50) {
+            pkt_count = 0;
+            ch_idx = (ch_idx + 1) % 3;
+            esp_wifi_set_channel(wifi_channels[ch_idx], WIFI_SECOND_CHAN_NONE);
+        }
+
+        vTaskDelay(1);
     }
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    if (rc != 0) {
-        LOG_ERR("BLE infer addr failed: %d", rc);
-        return;
-    }
-
-    struct ble_hs_adv_fields adv_fields = {0};
-    struct ble_gap_adv_params adv_params = {0};
-
-    adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    adv_fields.name = (uint8_t*)"JAM";
-    adv_fields.name_len = 3;
-    adv_fields.name_is_complete = 1;
-
-    rc = ble_gap_adv_set_fields(&adv_fields);
-    if (rc != 0) {
-        LOG_ERR("BLE set adv fields failed: %d", rc);
-        return;
-    }
-
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-
-    rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, NULL, NULL);
-    if (rc != 0) {
-        LOG_ERR("BLE adv start failed: %d", rc);
-        return;
-    }
-    LOG_BLE("Advertising started (3rd TX on built-in antenna)");
 }
 
-static void ble_on_sync(void)
+static void log_nrf24_spi_probe(const char* bus_name, SPI& spi)
 {
-    ble_svc_gap_device_name_set("JAM");
-    start_ble_advertising();
-}
-
-static void ble_on_reset(int reason)
-{
-    LOG_WRN("NimBLE reset, reason %d", reason);
-}
-
-static void nimble_host_task(void* param)
-{
-    nimble_port_run();
-    nimble_port_freertos_deinit();
-    vTaskDelete(NULL);
-}
-
-static void init_ble_third_transmitter(void)
-{
-    // Order per ESP-IDF NimBLE_Beacon: port init first, then host config (store), then GAP, then host task
-    esp_err_t ret = nimble_port_init();
-    if (ret != ESP_OK) {
-        LOG_ERR("NimBLE init failed: %s", esp_err_to_name(ret));
+    uint8_t st_aw = 0, aw = 0;
+    uint8_t st_cfg = 0, cfg = 0;
+    if (!spi.readNrf24Register(SETUP_AW, &st_aw, &aw)) {
+        LOG_WRN("%s SPI probe: bus not initialized", bus_name);
         return;
     }
-
-    ble_hs_cfg.reset_cb = ble_on_reset;
-    ble_hs_cfg.sync_cb = ble_on_sync;
-    // No bonding/store for advertiser-only; skip store to avoid init crash
-    ble_hs_cfg.store_status_cb = nullptr;
-    // ble_store_config_init();  // not needed for non-connectable advertising
-
-    ble_svc_gap_init();
-
-    xTaskCreate(nimble_host_task, "nimble_host", 4096, NULL, 5, NULL);
-    LOG_BLE("Host task started (3rd transmitter)");
+    (void)spi.readNrf24Register(NRF_CONFIG, &st_cfg, &cfg);
+    LOG_WRN("%s SPI probe: SETUP_AW=0x%02x (status=0x%02x) CONFIG=0x%02x (status=0x%02x)",
+            bus_name, (unsigned)aw, (unsigned)st_aw, (unsigned)cfg, (unsigned)st_cfg);
+    LOG_WRN("%s If SETUP_AW is 0x03 and CONFIG ~0x08: chip likely OK (check CE/SPI speed). 0xFF/0x00: MISO floating or MOSI/SCK/CSN wrong, or no 3.3V/GND.",
+            bus_name);
 }
 
 static void init_nrf24_modules(void)
 {
     LOG_INIT("SPI0 (HSPI): SCK=%d MISO=%d MOSI=%d CSN=%d", SCK_PIN_1, MISO_PIN_1, MOSI_PIN_1, CSN_PIN_1);
-    spi0.begin(SCK_PIN_1, MISO_PIN_1, MOSI_PIN_1, CSN_PIN_1, 10000000);
+    spi0.begin(SCK_PIN_1, MISO_PIN_1, MOSI_PIN_1, CSN_PIN_1, JAMMER_NRF24_SPI_HZ);
     LOG_INIT("SPI1 (VSPI): SCK=%d MISO=%d MOSI=%d CSN=%d", SCK_PIN_2, MISO_PIN_2, MOSI_PIN_2, CSN_PIN_2);
-    spi1.begin(SCK_PIN_2, MISO_PIN_2, MOSI_PIN_2, CSN_PIN_2, 10000000);
+    spi1.begin(SCK_PIN_2, MISO_PIN_2, MOSI_PIN_2, CSN_PIN_2, JAMMER_NRF24_SPI_HZ);
 
     bool module1_ok = false;
     bool module2_ok = false;
@@ -474,131 +412,201 @@ static void init_nrf24_modules(void)
     LOG_RF1("begin() CE=%d CSN=%d...", CE_PIN_1, CSN_PIN_1);
     if (radio1.begin(&spi0)) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        radio1.setAutoAck(false);
-        radio1.stopListening();
-        radio1.setRetries(0, 0);
-        radio1.setPayloadSize(5);
-        radio1.setAddressWidth(3);
-        radio1.setPALevel(RF24_PA_MAX, true);
-        radio1.setDataRate(RF24_2MBPS);
-        radio1.setCRCLength(RF24_CRC_DISABLED);
-        bool conn = radio1.isChipConnected();
-        LOG_RF1("OK | connected=%s", conn ? "yes" : "no");
+        LOG_RF1("OK | connected=%s", radio1.isChipConnected() ? "yes" : "no");
         module1_ok = true;
     } else {
         LOG_ERR("RF1 (HSPI) begin FAILED - check wiring CE=%d CSN=%d", CE_PIN_1, CSN_PIN_1);
+        log_nrf24_spi_probe("RF1", spi0);
     }
 
     LOG_RF2("begin() CE=%d CSN=%d...", CE_PIN_2, CSN_PIN_2);
     if (radio2.begin(&spi1)) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        radio2.setAutoAck(false);
-        radio2.stopListening();
-        radio2.setRetries(0, 0);
-        radio2.setPayloadSize(5);
-        radio2.setAddressWidth(3);
-        radio2.setPALevel(RF24_PA_MAX, true);
-        radio2.setDataRate(RF24_2MBPS);
-        radio2.setCRCLength(RF24_CRC_DISABLED);
-        bool conn = radio2.isChipConnected();
-        LOG_RF2("OK | connected=%s", conn ? "yes" : "no");
+        LOG_RF2("OK | connected=%s", radio2.isChipConnected() ? "yes" : "no");
         module2_ok = true;
     } else {
         LOG_ERR("RF2 (VSPI) begin FAILED - check wiring CE=%d CSN=%d", CE_PIN_2, CSN_PIN_2);
+        log_nrf24_spi_probe("RF2", spi1);
     }
 
     if (!module1_ok && !module2_ok) {
         LOG_ERR("No NRF24 modules. Button/BLE still work.");
+        LOG_WRN("Hardware check: 3.3V on VCC, common GND, swap MISO/MOSI if probe is 0xFF/0x00; test module on a known-good Arduino+nRF24 sketch.");
         return;
     }
 
-    LOG_INIT("NRF24 config: AutoAck=OFF, PA=MAX, 2Mbps, CRC=OFF");
-    if (module1_ok) {
-        LOG_RF1("--- register dump ---");
-        radio1.printDetails();
-    }
-    if (module2_ok) {
-        LOG_RF2("--- register dump ---");
-        radio2.printDetails();
+    // ---- RF self-test: each radio transmits CW, the other scans RPD ----
+    if (module1_ok && module2_ok) {
+        const uint8_t test_ch = 50;
+        LOG_INIT("=== RF SELF-TEST on ch %d ===", test_ch);
+
+        // Test 1: RF1 TX → RF2 RX (full re-init both radios first)
+        radio1.begin(&spi0);
+        radio2.begin(&spi1);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        radio2.setChannel(test_ch);
+        radio2.startListening();
+        vTaskDelay(pdMS_TO_TICKS(2));
+
+        radio1.stopListening();
+        radio1.startConstCarrier(RF24_PA_MAX, test_ch);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        bool rpd_r2 = radio2.testRPD();
+        radio1.stopConstCarrier();
+        radio2.stopListening();
+
+        if (rpd_r2)
+            LOG_RF1("TX -> RF2 detected signal (RPD=1). RF1 IS transmitting.");
+        else
+            LOG_ERR("TX -> RF2 detected NOTHING (RPD=0). RF1 may not be transmitting! Check antenna / PA.");
+
+        // Test 2: RF2 TX → RF1 RX (full re-init both radios again)
+        radio1.begin(&spi0);
+        radio2.begin(&spi1);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+        radio1.setChannel(test_ch);
+        radio1.startListening();
+        vTaskDelay(pdMS_TO_TICKS(2));
+
+        radio2.stopListening();
+        radio2.startConstCarrier(RF24_PA_MAX, test_ch);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        bool rpd_r1 = radio1.testRPD();
+        radio2.stopConstCarrier();
+        radio1.stopListening();
+
+        if (rpd_r1)
+            LOG_RF2("TX -> RF1 detected signal (RPD=1). RF2 IS transmitting.");
+        else
+            LOG_ERR("TX -> RF1 detected NOTHING (RPD=0). RF2 may not be transmitting! Check antenna / PA.");
+
+        LOG_INIT("=== RF SELF-TEST done: RF1=%s RF2=%s ===",
+                 rpd_r2 ? "TX_OK" : "TX_FAIL", rpd_r1 ? "TX_OK" : "TX_FAIL");
     }
 
-    LOG_JAM("Starting constant carrier at boot (ch=%d)...", (int)currentChannel);
-    if (module1_ok) {
-        radio1.startConstCarrier(RF24_PA_MAX, currentChannel);
-        vTaskDelay(pdMS_TO_TICKS(15));
-        LOG_RF1("ConstCarrier ON ch=%d", (int)radio1.getChannel());
-    }
-    if (module2_ok) {
-        radio2.startConstCarrier(RF24_PA_MAX, currentChannel);
-        vTaskDelay(pdMS_TO_TICKS(15));
-        LOG_RF2("ConstCarrier ON ch=%d", (int)radio2.getChannel());
-    }
+    if (module1_ok) configure_radio_for_tx(radio1);
+    if (module2_ok) configure_radio_for_tx(radio2);
+
+    LOG_INIT("NRF24 TX config: AutoAck=OFF, PA=MAX, 2Mbps, CRC=OFF");
+    if (module1_ok) { LOG_RF1("--- register dump ---"); radio1.printDetails(); }
+    if (module2_ok) { LOG_RF2("--- register dump ---"); radio2.printDetails(); }
+
     s_jamming_active = true;
-    LOG_JAM("ON at boot. Short-press=stop, long-press=change mode.");
-    LOG_INIT("Check: RF_SETUP bit7=CONT_WAVE, CE=HIGH. If no jam: antennas on, 3.3V>100mA/module, target 1-2m.");
-    if (module1_ok) {
-        LOG_RF1("--- after carrier ON (expect RF_CH=45, RF_SETUP bit7=1) ---");
-        radio1.printDetails();
-    }
-    if (module2_ok) {
-        LOG_RF2("--- after carrier ON (expect RF_CH=45, RF_SETUP bit7=1) ---");
-        radio2.printDetails();
-    }
+    LOG_JAM("ON at boot (BARRAGE). Short-press=stop, long-press=change mode.");
 }
 
-// Re-apply full continuous carrier so CONT_WAVE + channel are definitely active.
-static void set_channel_and_apply(RF24& radio, uint8_t channel)
+static void configure_radio_for_tx(RF24& radio)
 {
-    radio.startConstCarrier(RF24_PA_MAX, channel);
-    vTaskDelay(pdMS_TO_TICKS(3));  // brief settle
+    radio.stopListening();
+    radio.setAutoAck(false);
+    radio.setRetries(0, 0);
+    radio.setPALevel(RF24_PA_MAX, true);
+    radio.setDataRate(RF24_2MBPS);
+    radio.setCRCLength(RF24_CRC_DISABLED);
+    radio.startConstCarrier(RF24_PA_MAX, 45);
 }
 
-static void set_channel_sweep(RF24& radio, uint8_t& channel, bool& dir)
+static void hop_carrier(RF24& radio, uint8_t channel)
 {
-    if (dir) {
-        channel++;
-        if (channel >= MAX_CHANNEL) {
-            channel = MAX_CHANNEL;
-            dir = false;
+    radio.ce(false);
+    radio.setChannel(channel);
+    radio.ce(true);
+}
+
+static void jam_task(void* arg)
+{
+    (void)arg;
+    uint32_t status_count = 0;
+    uint32_t yield_count = 0;
+    for (;;) {
+        if (!s_jamming_active) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            status_count = 0;
+            yield_count = 0;
+            continue;
         }
-    } else {
-        if (channel > MIN_CHANNEL) channel--;
-        if (channel <= MIN_CHANNEL) {
-            channel = MIN_CHANNEL;
-            dir = true;
+        switch (currentMode) {
+            case MODE_BARRAGE:          jam_barrage(); break;
+            case MODE_BT_CLASSIC_SPLIT: jam_bt_classic_split(); break;
+            case MODE_BLE_ALL_DATA:     jam_ble_all_data(); break;
+            case MODE_CONSTANT_CARRIER: jam_constant_carrier(); break;
+            default: break;
+        }
+        if (++status_count >= 50000) {
+            status_count = 0;
+            LOG_JAM("Status: active | mode=%d R1=%s R2=%s", (int)currentMode,
+                    radio1.isChipConnected() ? "ok" : "FAIL",
+                    radio2.isChipConnected() ? "ok" : "FAIL");
+        }
+        if (++yield_count >= 200) {
+            yield_count = 0;
+            vTaskDelay(1);
         }
     }
-    set_channel_and_apply(radio, channel);
 }
 
-static void set_constant_carrier(RF24& radio, uint8_t channel)
+// MODE 0: BARRAGE — both radios hop to random independent channels, CW carrier
+static void jam_barrage(void)
 {
-    set_channel_and_apply(radio, channel);
+    hop_carrier(radio1, rand_channel());
+    hop_carrier(radio2, rand_channel());
+}
+
+// MODE 1: BT CLASSIC SPLIT — radio1 sweeps 0-39, radio2 sweeps 40-79
+static void jam_bt_classic_split(void)
+{
+    hop_carrier(radio1, sweep_ch1);
+    hop_carrier(radio2, sweep_ch2);
+
+    if (sweep_dir1) { if (++sweep_ch1 >= 39) sweep_dir1 = false; }
+    else            { if (sweep_ch1 == 0)     sweep_dir1 = true; else sweep_ch1--; }
+
+    if (sweep_dir2) { if (++sweep_ch2 >= 79) sweep_dir2 = false; }
+    else            { if (sweep_ch2 <= 40)    sweep_dir2 = true; else sweep_ch2--; }
+}
+
+// NRF24 channels that overlap BLE data + advertising channels
+// BLE uses 2402 + ch*2 MHz (ch 0-39), nRF24 uses 2400 + RF_CH MHz
+static const uint8_t ble_nrf_channels[] = {
+     2,  4,  6,  8, 10, 12, 14, 16, 18, 20,
+    22, 24, 26, 28, 30, 32, 34, 36, 38, 40,
+    42, 44, 46, 48, 50, 52, 54, 56, 58, 60,
+    62, 64, 66, 68, 70, 72, 74, 76, 78, 80,
+};
+#define BLE_NRF_CH_COUNT (sizeof(ble_nrf_channels) / sizeof(ble_nrf_channels[0]))
+
+// MODE 2: BLE ALL DATA — cycle through all 40 BLE-mapped channels with CW carrier
+static void jam_ble_all_data(void)
+{
+    static uint8_t idx1 = 0, idx2 = 20;
+    hop_carrier(radio1, ble_nrf_channels[idx1]);
+    hop_carrier(radio2, ble_nrf_channels[idx2]);
+    idx1 = (idx1 + 1) % BLE_NRF_CH_COUNT;
+    idx2 = (idx2 + 1) % BLE_NRF_CH_COUNT;
+}
+
+// MODE 3: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
+static void jam_constant_carrier(void)
+{
+    radio1.startConstCarrier(RF24_PA_MAX, 45);
+    radio2.startConstCarrier(RF24_PA_MAX, 45);
+    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 static void apply_jamming_mode_once(void)
 {
+    configure_radio_for_tx(radio1);
+    configure_radio_for_tx(radio2);
     switch (currentMode) {
-        case MODE_BLUETOOTH_CLASSIC:
-            set_channel_and_apply(radio1, currentChannel);
-            set_channel_and_apply(radio2, currentChannel);
-            break;
-        case MODE_BLUETOOTH_BLE: {
-            const uint8_t bleChannels[] = { 2, 26, 80 };
-            set_channel_and_apply(radio1, bleChannels[0]);
-            set_channel_and_apply(radio2, bleChannels[0]);
-            break;
-        }
-        case MODE_DUAL_SWEEP:
-            set_channel_sweep(radio1, dual_ch1, dual_dir1);
-            set_channel_sweep(radio2, dual_ch2, dual_dir2);
-            break;
-        case MODE_CONSTANT_CARRIER:
-            set_constant_carrier(radio1, 45);
-            set_constant_carrier(radio2, 45);
-            break;
-        default:
-            break;
+        case MODE_BARRAGE:          jam_barrage(); break;
+        case MODE_BT_CLASSIC_SPLIT: jam_bt_classic_split(); break;
+        case MODE_BLE_ALL_DATA:     jam_ble_all_data(); break;
+        case MODE_CONSTANT_CARRIER: jam_constant_carrier(); break;
+        default: break;
     }
 }
 
@@ -606,10 +614,10 @@ static void print_mode(void)
 {
     const char* modeStr = "UNKNOWN";
     switch (currentMode) {
-        case MODE_BLUETOOTH_CLASSIC: modeStr = "BLUETOOTH CLASSIC (sweep 0-79)"; break;
-        case MODE_BLUETOOTH_BLE:     modeStr = "BLUETOOTH BLE (advertising ch 2,26,80)"; break;
-        case MODE_DUAL_SWEEP:        modeStr = "DUAL SWEEP (low + high)"; break;
-        case MODE_CONSTANT_CARRIER:  modeStr = "CONSTANT CARRIER (ch 45)"; break;
+        case MODE_BARRAGE:          modeStr = "BARRAGE (random-hop CW carrier)"; break;
+        case MODE_BT_CLASSIC_SPLIT: modeStr = "BT CLASSIC SPLIT (0-39 / 40-79)"; break;
+        case MODE_BLE_ALL_DATA:     modeStr = "BLE ALL DATA (40 ch CW hop)"; break;
+        case MODE_CONSTANT_CARRIER: modeStr = "CONSTANT CARRIER (ch 45)"; break;
         default: break;
     }
     LOG_MODE("Current: %s", modeStr);
@@ -621,14 +629,8 @@ static void switch_mode(void)
     currentMode = (JammerMode)((currentMode + 1) % MODE_COUNT);
     LOG_MODE("Switch %d -> %d", prev, (int)currentMode);
     print_mode();
-    currentChannel = 45;
-    directionUp = true;
-    dual_ch1 = 0;
-    dual_ch2 = 40;
-    dual_dir1 = true;
-    dual_dir2 = true;
-    if (s_jamming_active) {
-        radio1.startConstCarrier(RF24_PA_MAX, currentChannel);
-        radio2.startConstCarrier(RF24_PA_MAX, currentChannel);
-    }
+    sweep_ch1 = 0;  sweep_ch2 = 40;
+    sweep_dir1 = true; sweep_dir2 = true;
+    configure_radio_for_tx(radio1);
+    configure_radio_for_tx(radio2);
 }
