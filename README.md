@@ -13,7 +13,7 @@
 - **ESP-IDF 5.x** (sourced in your shell)
 - **ESP32-S3** board (e.g. Lonely Binary 2520V5 N16R8)
 - **2x NRF24L01+PA+LNA** modules
-- **HW-131 breadboard power supply** (AMS1117-3.3) or equivalent 3.3 V / 300 mA+ regulator
+- **1x HW-131 breadboard power supply** (5V) + **2x AMS1117-3.3V regulators** (one per NRF24 module)
 - **2x 100 uF electrolytic capacitors** (one per NRF24 module)
 
 ---

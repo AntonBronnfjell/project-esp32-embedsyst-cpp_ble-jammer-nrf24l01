@@ -22,7 +22,7 @@ This project implements a multi-path 2.4 GHz jammer using three simultaneous tra
 - **ESP-IDF 5.x** (build and flash toolchain).
 - **ESP32-S3** (e.g. Lonely Binary 2520V5 N16R8).
 - **2× NRF24L01+PA+LNA** modules.
-- **HW-131 breadboard power supply** (with AMS1117-3.3 regulator) or equivalent 3.3 V supply capable of ~300 mA for both NRF24 modules.
+- **1x HW-131 breadboard power supply** (5 V source) + **2x AMS1117-3.3V regulators** (one per NRF24 module).
 - **2x 100 µF electrolytic capacitors** (one per NRF24 module, at VCC/GND). See [Capacitor placement](capacitor-placement.md).
 
 ---
@@ -69,14 +69,17 @@ Used GPIOs and functions:
 
 ## Hardware – Full wiring
 
-### Power supply (HW-131 + AMS1117-3.3)
+### Power supply (1x HW-131 + 2x AMS1117-3.3)
 
-The NRF24L01+PA+LNA modules draw up to ~150 mA each at max TX power. The ESP32's on-board 3.3 V regulator cannot reliably supply both modules. Use an external **HW-131 breadboard power supply module** (which has an **AMS1117-3.3** voltage regulator on-board):
+Each NRF24L01+PA+LNA module draws up to ~150 mA at max TX power. The ESP32's on-board 3.3 V regulator cannot reliably supply both modules. Use one **HW-131 breadboard power supply** as the 5 V source, feeding **two separate AMS1117-3.3V regulators** — one dedicated to each RF module:
 
-- **5 V input** to the HW-131 via barrel jack or USB.
-- **HW-131 3.3 V output** to both RF module VCC pins.
-- **Common GND** between HW-131, ESP32, RF1, and RF2 (all grounds must be connected together).
+- **HW-131** provides 5 V (via barrel jack or USB).
+- **AMS1117-3.3V #1** takes 5 V from HW-131 → outputs 3.3 V to **RF1 Pin 2 (VCC) only**.
+- **AMS1117-3.3V #2** takes 5 V from HW-131 → outputs 3.3 V to **RF2 Pin 2 (VCC) only**.
+- **Common GND** between HW-131, both AMS1117s, ESP32, RF1, and RF2 (all grounds must be connected together).
 - **100 µF electrolytic capacitor** across VCC/GND at each RF module, as close to the module pins as possible.
+
+Using separate regulators per module eliminates cross-module voltage sag during simultaneous TX bursts.
 
 ### SPI and control wiring
 
@@ -244,7 +247,7 @@ Together, these three channels cover approximately 60 of the 79 BT Classic chann
 
 ## Power
 
-- **HW-131 + AMS1117-3.3** is the recommended power supply. It takes 5 V in (barrel jack or USB) and outputs a stable 3.3 V for both NRF24 modules. The AMS1117-3.3 can supply up to 800 mA — more than enough for two PA+LNA modules (~300 mA combined peak).
+- **1x HW-131 + 2x AMS1117-3.3** is the recommended power supply. The HW-131 provides 5 V, and each AMS1117-3.3V regulator independently powers one NRF24 module with clean 3.3 V. Having separate regulators ensures one module's TX current spikes don't affect the other.
 - **Do NOT power both NRF24 modules from the ESP32's on-board 3.3 V regulator.** The ESP32's regulator is typically rated for ~500 mA total (ESP32 + peripherals), and two PA+LNA modules at max TX can cause voltage sag that resets the ESP32 or causes SPI errors.
 - **100 µF electrolytic capacitor** per module at VCC/GND, as close as possible to the module pins. These smooth out the current spikes during TX bursts.
 - **Common ground** is critical: HW-131 GND, ESP32 GND, RF1 GND, and RF2 GND must all be connected together. A floating ground causes SPI failures and erratic behavior.
