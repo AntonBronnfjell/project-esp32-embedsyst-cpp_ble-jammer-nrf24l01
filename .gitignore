@@ -8,6 +8,7 @@ dependencies.lock
 # System and IDE
 .DS_Store
 .idea/
+.cursor/
 cmake-build-*/
 *.swp
 *.swo
