@@ -214,19 +214,8 @@ extern "C" void app_main(void)
         if (ev == 1) {
             LOG_BTN("Short press (%u ms) -> toggle jamming", (unsigned)s_last_press_duration_ms);
             s_jamming_active = !s_jamming_active;
-            if (s_jamming_active) {
-                LOG_JAM("Powering up radios...");
-                radio1.powerUp();
-                radio2.powerUp();
-                vTaskDelay(pdMS_TO_TICKS(10));
-                apply_jamming_mode_once();
-                LOG_JAM("ON | R1=%s R2=%s",
-                        radio1.isChipConnected() ? "ok" : "FAIL",
-                        radio2.isChipConnected() ? "ok" : "FAIL");
-            } else {
-                stop_jamming_radios();
-                LOG_JAM_OFF("OFF (radios in power-down)");
-            }
+            if (s_jamming_active) LOG_JAM("ON");
+            else                  LOG_JAM_OFF("OFF");
         } else if (ev == 2) {
             LOG_BTN("Long press (%u ms) -> cycle mode", (unsigned)s_last_press_duration_ms);
             switch_mode();
@@ -501,6 +490,8 @@ static void init_nrf24_modules(void)
 
 static void configure_radio_for_tx(RF24& radio)
 {
+    radio.powerUp();
+    vTaskDelay(pdMS_TO_TICKS(5));
     radio.stopListening();
     radio.setAutoAck(false);
     radio.setRetries(0, 0);
@@ -510,11 +501,11 @@ static void configure_radio_for_tx(RF24& radio)
     radio.startConstCarrier(RF24_PA_MAX, 45);
 }
 
+// Per Bruce firmware and Nordic docs: just setChannel(), do NOT toggle CE.
+// PLL re-locks in ~130µs. CE stays HIGH → carrier never fully off → max duty cycle.
 static void hop_carrier(RF24& radio, uint8_t channel)
 {
-    radio.ce(false);
     radio.setChannel(channel);
-    radio.ce(true);
 }
 
 static void jam_task(void* arg)
@@ -522,13 +513,30 @@ static void jam_task(void* arg)
     (void)arg;
     uint32_t status_count = 0;
     uint32_t yield_count = 0;
+    bool was_active = false;
+
     for (;;) {
         if (!s_jamming_active) {
+            if (was_active) {
+                stop_jamming_radios();
+                LOG_JAM_OFF("Radios powered down");
+                was_active = false;
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             status_count = 0;
             yield_count = 0;
             continue;
         }
+
+        if (!was_active) {
+            configure_radio_for_tx(radio1);
+            configure_radio_for_tx(radio2);
+            LOG_JAM("Radios active | R1=%s R2=%s",
+                    radio1.isChipConnected() ? "ok" : "FAIL",
+                    radio2.isChipConnected() ? "ok" : "FAIL");
+            was_active = true;
+        }
+
         switch (currentMode) {
             case MODE_BARRAGE:          jam_barrage(); break;
             case MODE_BT_CLASSIC_SPLIT: jam_bt_classic_split(); break;
@@ -631,6 +639,4 @@ static void switch_mode(void)
     print_mode();
     sweep_ch1 = 0;  sweep_ch2 = 40;
     sweep_dir1 = true; sweep_dir2 = true;
-    configure_radio_for_tx(radio1);
-    configure_radio_for_tx(radio2);
 }
