@@ -13,7 +13,8 @@
 - **ESP-IDF 5.x** (sourced in your shell)
 - **ESP32-S3** board (e.g. Lonely Binary 2520V5 N16R8)
 - **2x NRF24L01+PA+LNA** modules
-- **3.3 V supply** (~200 mA capable for both radios)
+- **HW-131 breadboard power supply** (AMS1117-3.3) or equivalent 3.3 V / 300 mA+ regulator
+- **2x 100 uF electrolytic capacitors** (one per NRF24 module)
 
 ---
 
