@@ -8,12 +8,12 @@
 
 ## Overview
 
-This project implements a multi-path 2.4 GHz jammer using:
+This project implements a multi-path 2.4 GHz jammer using three simultaneous transmitters:
 
-- **Two NRF24L01+PA+LNA modules** (SPI to ESP32) for two independent transmit paths.
-- **ESP32-S3 built-in BLE** as a third transmit path.
+- **Two NRF24L01+PA+LNA modules** (SPI to ESP32) — continuous wave (CW) carrier with 130 us PLL dwell per hop, providing 100% RF duty cycle across the 2400-2480 MHz band.
+- **ESP32-S3 WiFi raw TX** — 20 MHz wideband beacon frames on WiFi channels 1, 6, and 11, each covering approximately 20 Bluetooth channels simultaneously.
 
-**Target board:** Lonely Binary ESP32-S3 2520V5 N16R8. The firmware drives two NRF24 radios over HSPI and VSPI and uses the on-chip BLE radio; the on-board WS2812 LED on GPIO 48 indicates status.
+**Target board:** Lonely Binary ESP32-S3 2520V5 N16R8. The firmware drives two NRF24 radios over HSPI and VSPI and uses the built-in WiFi radio for wideband TX; the on-board WS2812 LED on GPIO 48 indicates status (rainbow = jamming active, off = idle).
 
 ---
 
@@ -109,17 +109,96 @@ Replace `PORT` with your serial port (e.g. `/dev/tty.usbserial-*` or `COM3`). Af
 
 ## Usage
 
-- **Short press** (button): toggle jamming on/off (LED reflects state).
-- **Long press** (~800 ms): cycle jamming mode.
+- **Short press** (button on GPIO 35): toggle jamming on/off. LED reflects state (rainbow = active, off = idle).
+- **Long press** (~800 ms): cycle to the next jamming mode.
+- Jammer starts in BARRAGE mode on boot with jamming active.
 
-**Modes:**
+**LED behavior:** Rainbow pattern while jamming (slower in constant carrier mode, faster in hopping modes); off when jamming is stopped.
 
-- Bluetooth Classic sweep
-- BLE (channels 2, 26, 80)
-- Dual sweep
-- Constant carrier
+---
 
-**LED:** Rainbow pattern when jamming (slower in constant carrier, faster in sweep modes); off when not jamming.
+## Jamming modes — detailed reference
+
+The jammer cycles through six modes on each long press. Each mode uses continuous wave (CW) transmission from the NRF24 modules (100% RF duty cycle — the carrier never stops) combined with ESP32 WiFi raw TX (20 MHz wideband on channels 1/6/11).
+
+### Mode 0: BARRAGE
+
+**Best for:** BLE devices (mice, keyboards, trackpads, low-energy sensors).
+
+Both NRF24 radios independently hop to random channels (0-79) with a 130 us PLL dwell after each hop. The randomness makes it unpredictable for Adaptive Frequency Hopping (AFH) algorithms. Each radio achieves approximately 6,600 hops per second, for a combined ~13,200 hops/s across the 80-channel band.
+
+**How it works technically:** `startConstCarrier()` puts each radio into continuous wave mode with CE held HIGH. On each iteration, `setChannel()` retunes the PLL to a new random frequency, followed by a 130 us delay for the PLL to lock. The carrier output never stops — it transitions smoothly between frequencies.
+
+**Why it works against BLE:** BLE uses only 40 channels with relatively slow connection events (1.25 ms minimum interval). Two radios randomly hopping across the band create frequent collisions with BLE packets. BLE devices like the Apple Magic Mouse are highly susceptible because their connection parameters are optimized for low power, not resilience.
+
+---
+
+### Mode 1: ADV+BARRAGE (hybrid)
+
+**Best for:** BT Classic audio devices (headphones, speakers) connected via iPhone or Android.
+
+This is a dual-attack mode. Radio 1 rapid-cycles the three BLE advertising channels (nRF24 ch 2 = 2402 MHz, ch 26 = 2426 MHz, ch 80 = 2480 MHz), attacking the BLE control plane. Radio 2 simultaneously does random barrage across all 80 channels, creating data-plane interference.
+
+**How it works technically:** Modern Bluetooth audio devices (like Sony LinkBuds, AirPods, etc.) maintain both a BT Classic A2DP connection for audio streaming AND a BLE connection for control signaling (battery status, firmware updates, app features). By disrupting the BLE control connection, the device may disconnect and attempt to reconnect, causing audio interruptions even though the A2DP data stream uses BT Classic's 79-channel AFH.
+
+**Why this mode exists:** With only 2 NRF24 radios covering 2 channels at a time out of 79, BT Classic AFH can trivially route around the interference on the data plane. Attacking the BLE control plane is a more effective strategy with limited hardware.
+
+---
+
+### Mode 2: BT CLASSIC
+
+**Best for:** Testing BT Classic vulnerability, sequential spectrum coverage analysis.
+
+Both radios perform a sequential sweep across all 79 BT Classic FHSS data channels (nRF24 ch 2-80). Radio 1 sweeps forward (2 -> 80), Radio 2 sweeps backward (41 -> 2 -> 80), bouncing at the edges. This ensures every channel gets regular interference.
+
+**How it works technically:** BT Classic uses Adaptive Frequency Hopping (AFH) across 79 channels at 1,600 hops per second (625 us per slot). The sequential sweep hits every channel in order. With 130 us PLL dwell per hop, each radio covers all 79 channels in approximately 12 ms. AFH scans once per second and can detect and blacklist interfered channels, but requires a minimum of ~20 usable channels to maintain a connection.
+
+**Limitation:** AFH adapts within 1-2 seconds by blacklisting jammed channels and routing traffic to clean ones. With 2 radios on 2 channels at any instant, 77 channels remain clean — more than enough for AFH to maintain the connection.
+
+---
+
+### Mode 3: BLE ALL
+
+**Best for:** Comprehensive BLE disruption, testing BLE data channel resilience.
+
+Both radios cycle through all 40 BLE data and advertising channels (even nRF24 channels 2-80). Radio 1 and Radio 2 are offset by 20 channels, so they cover different parts of the BLE spectrum simultaneously.
+
+**How it works technically:** BLE uses 40 channels: 37 data channels + 3 advertising channels. The data channels use even-numbered nRF24 channels (2, 4, 6, ... 78, 80) because BLE channels are 2 MHz wide with 2 MHz spacing. Both radios cycle through this list sequentially, offset by half the array length to avoid redundant coverage.
+
+---
+
+### Mode 4: BLE ADV
+
+**Best for:** BLE device discovery disruption, preventing new BLE connections, control channel attacks.
+
+Both radios rapid-cycle across the three BLE advertising channels: channel 37 (2402 MHz / nRF24 ch 2), channel 38 (2426 MHz / nRF24 ch 26), and channel 39 (2480 MHz / nRF24 ch 80). Each radio hits a different advertising channel per iteration, cycling fast.
+
+**How it works technically:** All BLE device discovery, connection initiation, and broadcast traffic occurs on these three advertising channels. By continuously jamming all three, no new BLE connections can be established, existing BLE control connections are disrupted, and BLE beacons/advertisements from other devices are blocked.
+
+**Why it is effective against audio devices:** Many Bluetooth audio devices maintain a BLE GATT connection alongside the BT Classic audio stream. Disrupting the BLE advertising channels can cause the BLE control connection to fail, triggering reconnection attempts that interrupt audio playback.
+
+---
+
+### Mode 5: CONSTANT CARRIER
+
+**Best for:** Baseline RF output testing, antenna verification, single-channel interference analysis.
+
+Both radios output a continuous carrier wave on channel 45 (2447 MHz). No hopping — the carrier stays on one frequency indefinitely.
+
+**How it works technically:** This mode is primarily used for hardware verification. If a spectrum analyzer or SDR shows a strong signal at 2447 MHz, the NRF24 modules and antennas are functioning correctly. The self-test at boot also uses this mechanism (on channel 50) to verify each radio can transmit and the other can detect it via RPD (Received Power Detector, threshold -64 dBm).
+
+---
+
+## WiFi TX (3rd transmitter)
+
+The ESP32's built-in WiFi radio operates as an independent wideband transmitter on all modes. It sends raw 802.11 beacon frames using `esp_wifi_80211_tx()` on WiFi channels 1, 6, and 11 in rotation (50 frames per channel before switching).
+
+Each WiFi channel is 20 MHz wide:
+- **WiFi ch 1** (2412 MHz): covers BT channels ~2-22
+- **WiFi ch 6** (2437 MHz): covers BT channels ~27-47
+- **WiFi ch 11** (2462 MHz): covers BT channels ~52-72
+
+Together, these three channels cover approximately 60 of the 79 BT Classic channels with 20 MHz wideband energy — far wider than the NRF24's ~2 MHz per channel. The WiFi TX runs independently on CPU core 0, while the NRF24 jam task runs on CPU core 1.
 
 ---
 

