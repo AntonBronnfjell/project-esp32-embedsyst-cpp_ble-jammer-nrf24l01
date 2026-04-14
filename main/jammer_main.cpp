@@ -144,6 +144,7 @@ static inline uint8_t rand_channel(void) {
 
 enum JammerMode {
     MODE_BARRAGE,           // LED: slow rainbow    | random hop all 80 ch
+    MODE_STORM,             // LED: purple breath   | R1=noise sweep + R2=CW strike
     MODE_BLE_ADV_BARRAGE,   // LED: cyan breath     | R1=adv ctrl + R2=random data
     MODE_TRACKING,          // LED: white breath     | concentrated 10-ch window sweep
     MODE_BT_CLASSIC,        // LED: blue breath     | sequential sweep ch 2-80
@@ -180,7 +181,9 @@ static void init_nrf24_modules(void);
 static void log_nrf24_spi_probe(const char* bus_name, SPI& spi);
 static void configure_radio_for_tx(RF24& radio);
 static void hop_carrier(RF24& radio, uint8_t channel);
+static void hop_carrier_fast(RF24& radio, uint8_t channel);
 static void jam_barrage(void);
+static void jam_storm(void);
 static void jam_ble_adv_barrage(void);
 static void jam_tracking(void);
 static void jam_bt_classic(void);
@@ -339,6 +342,7 @@ static void init_rgb_led(void)
 static void get_mode_color(JammerMode mode, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     switch (mode) {
+        case MODE_STORM:            *r = 150; *g =   0; *b = 200; break; // purple
         case MODE_BLE_ADV_BARRAGE:  *r =   0; *g = 200; *b = 200; break; // cyan
         case MODE_TRACKING:         *r = 200; *g = 200; *b = 200; break; // white
         case MODE_BT_CLASSIC:       *r =   0; *g =   0; *b = 200; break; // blue
@@ -708,6 +712,14 @@ static void hop_carrier(RF24& radio, uint8_t channel)
     esp_rom_delay_us(130);
 }
 
+// Fast hop: NO PLL dwell. The PLL starts retuning but never locks before the
+// next hop — the carrier continuously sweeps through intermediate frequencies,
+// creating broadband noise wider than the stable 2 kHz CW tone.
+static void hop_carrier_fast(RF24& radio, uint8_t channel)
+{
+    radio.setChannel(channel);
+}
+
 static void jam_task(void* arg)
 {
     (void)arg;
@@ -747,6 +759,7 @@ static void jam_task(void* arg)
 
         switch (currentMode) {
             case MODE_BARRAGE:          jam_barrage(); break;
+            case MODE_STORM:            jam_storm(); break;
             case MODE_BLE_ADV_BARRAGE:  jam_ble_adv_barrage(); break;
             case MODE_TRACKING:         jam_tracking(); break;
             case MODE_BT_CLASSIC:       jam_bt_classic(); break;
@@ -775,6 +788,18 @@ static void jam_task(void* arg)
 static void jam_barrage(void)
 {
     hop_carrier(radio1, rand_channel());
+    hop_carrier(radio2, rand_channel());
+}
+
+// MODE 1: STORM — dual-strategy interference (scientifically optimized).
+// Radio 1 "NOISE": no PLL dwell → PLL continuously sweeps between channels,
+//   creating broadband noise wider than the 2 kHz stable CW tone. ~50k hops/s.
+// Radio 2 "STRIKE": 130µs PLL dwell → stable CW at channel center frequency,
+//   precise interference that corrupts GFSK demodulation. ~6600 hops/s.
+// Two complementary interference types that receivers can't optimize for both.
+static void jam_storm(void)
+{
+    hop_carrier_fast(radio1, rand_channel());
     hop_carrier(radio2, rand_channel());
 }
 
@@ -903,6 +928,7 @@ static void print_mode(void)
     const char* modeStr = "UNKNOWN";
     switch (currentMode) {
         case MODE_BARRAGE:          modeStr = "BARRAGE [rainbow] random hop all 80ch"; break;
+        case MODE_STORM:            modeStr = "STORM [purple] R1=noise sweep, R2=CW strike"; break;
         case MODE_BLE_ADV_BARRAGE:  modeStr = "ADV+BARRAGE [cyan] R1=adv ctrl, R2=random"; break;
         case MODE_TRACKING:         modeStr = "TRACKING [white] both radios alternate adv+barrage"; break;
         case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC [blue] sweep ch 2-80"; break;

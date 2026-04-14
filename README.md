@@ -64,12 +64,14 @@ The jammer boots in **BARRAGE** mode and cycles through the following modes on e
 | # | Mode | LED | Best for | How it works |
 |---|------|-----|----------|-------------|
 | 0 | **BARRAGE** | Slow rainbow | BLE devices (mice, keyboards) | Both radios randomly hop all 80 channels with 130 us PLL dwell. 100% CW duty cycle. ~6600 hops/s per radio. |
-| 1 | **ADV+BARRAGE** | Cyan breathing | Audio devices (hybrid control+data attack) | R1 rapid-cycles BLE advertising channels (2, 26, 80) disrupting the control plane. R2 does random barrage across all channels hitting the data plane. |
-| 2 | **TRACKING** | White breathing | Concentrated regional attack | Both radios focus on a 10-channel window that slides across the spectrum every ~500ms. 20% hit rate per channel (8x more concentrated than barrage). Full spectrum swept every ~4s. BLE device discovery at startup. |
-| 3 | **BT CLASSIC** | Blue breathing | BT Classic data connections | Sequential CW sweep across all 79 BT Classic channels (nRF24 ch 2-80). Radios sweep in opposite directions for maximum coverage. |
-| 4 | **BLE ALL** | Green breathing | All BLE connections | Cycles through all 40 BLE data + advertising channels (even nRF24 channels 2-80). Radios offset by 20 channels. |
-| 5 | **BLE ADV** | Yellow breathing | BLE control disruption | Both radios rapid-cycle the 3 BLE advertising channels (2402/2426/2480 MHz). Most effective at disrupting BLE device discovery and control connections. |
-| 6 | **CONSTANT CARRIER** | Red breathing | Baseline / antenna testing | Both radios output continuous carrier on channel 45 (2447 MHz). Used to verify RF output. |
+| 1 | **STORM** | Purple breathing | Enhanced barrage (dual-strategy) | R1 hops with NO PLL dwell (~50k hops/s) creating broadband noise from continuous PLL sweeping. R2 hops with 130us dwell for precision CW strikes. Two complementary interference types. |
+| 2 | **ADV+BARRAGE** | Cyan breathing | Audio devices (hybrid control+data attack) | R1 rapid-cycles BLE advertising channels (2, 26, 80) disrupting the control plane. R2 does random barrage across all channels hitting the data plane. |
+| 3 | **TRACKING** | White breathing | Dual-vector aggressive | Both radios alternate between BLE adv channels and random barrage in 1:1 ratio. 2x ADV pressure vs ADV+BARRAGE. |
+| 4 | **BT CLASSIC** | Blue breathing | BT Classic data connections | Sequential CW sweep across all 79 BT Classic channels (nRF24 ch 2-80). Radios sweep in opposite directions. |
+| 5 | **BLE ALL** | Green breathing | All BLE connections | Cycles through all 40 BLE data + advertising channels. Radios offset by 20 channels. |
+| 6 | **BLE ADV** | Yellow breathing | BLE control disruption | Both radios rapid-cycle the 3 BLE advertising channels (2402/2426/2480 MHz). |
+| 7 | **BLE SIEGE** | Orange breathing | BLE data+adv attack | Both radios random across all 40 BLE-specific channels (37 data + 3 adv). 2x BLE density vs barrage. |
+| 8 | **CONSTANT CARRIER** | Red breathing | Baseline / antenna testing | Both radios output continuous carrier on channel 45 (2447 MHz). |
 
 All hopping modes use **continuous wave (CW) with 130 us PLL dwell** — the carrier never stops, it just retunes frequency each hop. WiFi raw TX (20 MHz wideband on ch 1/6/11) runs independently on all modes.
 

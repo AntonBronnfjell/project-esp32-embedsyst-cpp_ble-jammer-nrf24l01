@@ -133,11 +133,13 @@ Each mode has a distinct LED color for at-a-glance identification:
 | Mode | LED Color | Animation |
 |------|-----------|-----------|
 | BARRAGE | Rainbow | Slow hue cycle |
-| ADV+BARRAGE | Cyan | Breathing (fade in/out) |
+| STORM | Purple | Breathing (fade in/out) |
+| ADV+BARRAGE | Cyan | Breathing |
 | TRACKING | White | Breathing |
 | BT CLASSIC | Blue | Breathing |
 | BLE ALL | Green | Breathing |
 | BLE ADV | Yellow | Breathing |
+| BLE SIEGE | Orange | Breathing |
 | CONSTANT CARRIER | Red | Breathing |
 | Jamming OFF | Off | — |
 
@@ -145,7 +147,7 @@ Each mode has a distinct LED color for at-a-glance identification:
 
 ## Jamming modes — detailed reference
 
-The jammer cycles through seven modes on each long press. All hopping modes use continuous wave (CW) transmission from the NRF24 modules (100% RF duty cycle — the carrier never stops) combined with ESP32 WiFi raw TX (20 MHz wideband on channels 1/6/11).
+The jammer cycles through nine modes on each long press. All hopping modes use continuous wave (CW) transmission from the NRF24 modules (100% RF duty cycle — the carrier never stops) combined with ESP32 WiFi raw TX (20 MHz wideband on channels 1/6/11).
 
 ### Mode 0: BARRAGE
 
@@ -159,7 +161,28 @@ Both NRF24 radios independently hop to random channels (0-79) with a 130 us PLL 
 
 ---
 
-### Mode 1: ADV+BARRAGE (hybrid)
+### Mode 1: STORM (dual-strategy interference)
+
+**Best for:** Enhanced barrage with scientifically optimized interference diversity.
+
+STORM splits the two radios into complementary roles based on IEEE research showing that interference diversity outperforms single-strategy attacks (JamRF, VTT Finland studies on WLAN jamming).
+
+**Radio 1 "NOISE"** — hops with NO PLL dwell (~50,000 hops/s). The PLL never locks between channel changes, causing the carrier to continuously sweep through intermediate frequencies. This creates broadband noise wider than the stable 2 kHz CW tone, filling more of the BLE receiver's 2 MHz channel bandwidth.
+
+**Radio 2 "STRIKE"** — hops with 130us PLL dwell (~6,600 hops/s). The PLL locks on each target channel, producing a stable CW tone at the exact center frequency. This precision interference corrupts the GFSK demodulator's bit decision threshold.
+
+**Why this works:** The nRF24L01+ CW mode produces a tone only ~2 kHz wide (measured +-1 kHz at -20dB). BLE channels are 2 MHz wide — a single CW tone covers just 0.1% of the channel bandwidth. Radio 1's PLL sweep noise covers significantly more bandwidth, while Radio 2's precision CW targets the critical center frequency. The receiver cannot optimize its filtering for both interference types simultaneously.
+
+| Metric | BARRAGE | STORM |
+|--------|---------|-------|
+| R1 hop rate | ~6,600/s | ~50,000/s |
+| R1 interference bandwidth | ~2 kHz (CW) | broadband (PLL sweep) |
+| R2 interference bandwidth | ~2 kHz (CW) | ~2 kHz (CW) |
+| Interference diversity | none | two complementary types |
+
+---
+
+### Mode 2: ADV+BARRAGE (hybrid)
 
 **Best for:** BT Classic audio devices (headphones, speakers) connected via iPhone or Android.
 
@@ -171,7 +194,7 @@ This is a dual-attack mode. Radio 1 rapid-cycles the three BLE advertising chann
 
 ---
 
-### Mode 2: TRACKING
+### Mode 3: TRACKING
 
 **Best for:** Concentrated regional interference, overcoming Adaptive Frequency Hopping.
 
@@ -188,7 +211,7 @@ Both radios focus on a narrow 10-channel window, hopping randomly within it. The
 
 ---
 
-### Mode 3: BT CLASSIC
+### Mode 4: BT CLASSIC
 
 **Best for:** Testing BT Classic vulnerability, sequential spectrum coverage analysis.
 
@@ -200,7 +223,7 @@ Both radios perform a sequential sweep across all 79 BT Classic FHSS data channe
 
 ---
 
-### Mode 4: BLE ALL
+### Mode 5: BLE ALL
 
 **Best for:** Comprehensive BLE disruption, testing BLE data channel resilience.
 
@@ -210,7 +233,7 @@ Both radios cycle through all 40 BLE data and advertising channels (even nRF24 c
 
 ---
 
-### Mode 5: BLE ADV
+### Mode 6: BLE ADV
 
 **Best for:** BLE device discovery disruption, preventing new BLE connections, control channel attacks.
 
@@ -222,7 +245,19 @@ Both radios rapid-cycle across the three BLE advertising channels: channel 37 (2
 
 ---
 
-### Mode 6: CONSTANT CARRIER
+### Mode 7: BLE SIEGE
+
+**Best for:** Attacking established BLE GATT control connections on data channels.
+
+After pairing, BLE connections use data channels 0-36 — NOT advertising channels. BLE ADV mode only hits 3 advertising channels, missing the active GATT connection entirely. BLE SIEGE targets ALL 40 BLE-specific channels (37 data + 3 advertising), mapped to exact nRF24 frequencies (even channels 2-80).
+
+**How it works technically:** Both radios randomly hop across the 40 BLE channel frequencies. This is 2x more concentrated on BLE than barrage (which wastes hops on odd nRF24 channels that don't correspond to BLE frequencies). Hit rate: 2 radios / 40 channels = 5% per hop vs barrage's 2 radios / 80 channels = 2.5%.
+
+**Why this matters for audio devices:** Many BT Classic audio devices (Sony, Apple, etc.) maintain a BLE GATT connection for control signaling (battery, codec negotiation, noise cancellation settings). If the GATT connection drops (supervision timeout ~720ms on iPhone), the device may attempt to reconnect, causing audio interruption.
+
+---
+
+### Mode 8: CONSTANT CARRIER
 
 **Best for:** Baseline RF output testing, antenna verification, single-channel interference analysis.
 
