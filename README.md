@@ -49,8 +49,10 @@ Replace `PORT` with your serial port (e.g. `/dev/cu.usbmodem101` or `COM3`).
 
 ## Controls
 
-- **Short press** (button on GPIO 35): toggle jamming on/off. LED reflects state (rainbow = active, off = idle).
+- **Short press** (button on GPIO 35): toggle jamming on/off.
 - **Long press** (~800 ms): cycle to the next jamming mode.
+- **LED off**: jamming stopped.
+- **LED breathing / rainbow**: jamming active (color indicates current mode).
 
 ---
 
@@ -58,16 +60,17 @@ Replace `PORT` with your serial port (e.g. `/dev/cu.usbmodem101` or `COM3`).
 
 The jammer boots in **BARRAGE** mode and cycles through the following modes on each long press:
 
-| # | Mode | Radios | Best for | How it works |
-|---|------|--------|----------|-------------|
-| 0 | **BARRAGE** | R1 + R2 random hop | BLE devices (mice, keyboards) | Both radios independently hop to random channels (0-79) with 130 us PLL dwell. 100% RF duty cycle via continuous carrier wave. ~6600 hops/s per radio. |
-| 1 | **ADV+BARRAGE** | R1 adv channels, R2 random | Audio headphones/speakers (hybrid) | Radio 1 rapid-cycles the 3 BLE advertising channels (2, 26, 80) attacking the control plane. Radio 2 does random barrage across all channels attacking the data plane. Combines both attack vectors. |
-| 2 | **BT CLASSIC** | R1 + R2 sweep | BT Classic data connections | Sequential sweep across all 79 BT Classic channels (nRF24 ch 2-80). Radios sweep in opposite directions for maximum coverage. |
-| 3 | **BLE ALL** | R1 + R2 cycle | All BLE connections | Cycles through all 40 BLE data + advertising channels (even nRF24 channels 2-80). Radios offset by 20 channels. |
-| 4 | **BLE ADV** | R1 + R2 rapid cycle | BLE control disruption | Both radios rapid-cycle the 3 BLE advertising channels (2402/2426/2480 MHz). Each radio hits a different channel per iteration. Most effective at disrupting BLE device discovery and control connections. |
-| 5 | **CONSTANT CARRIER** | R1 + R2 on ch 45 | Baseline testing | Both radios output continuous carrier on channel 45 (2447 MHz). Used to verify RF output and as a single-channel reference test. |
+| # | Mode | LED | Best for | How it works |
+|---|------|-----|----------|-------------|
+| 0 | **BARRAGE** | Slow rainbow | BLE devices (mice, keyboards) | Both radios randomly hop all 80 channels with 130 us PLL dwell. 100% CW duty cycle. ~6600 hops/s per radio. |
+| 1 | **ADV+BARRAGE** | Cyan breathing | Audio devices (hybrid control+data attack) | R1 rapid-cycles BLE advertising channels (2, 26, 80) disrupting the control plane. R2 does random barrage across all channels hitting the data plane. |
+| 2 | **PERCEPTIVE** | Magenta breathing | Multi-vector aggressive targeting | R1 interleaves BLE adv channel hits (every 4th hop) with random barrage. R2 does pure random barrage. Combines control-plane pressure with full-spectrum coverage. BLE device discovery at startup logs nearby devices. |
+| 3 | **BT CLASSIC** | Blue breathing | BT Classic data connections | Sequential CW sweep across all 79 BT Classic channels (nRF24 ch 2-80). Radios sweep in opposite directions for maximum coverage. |
+| 4 | **BLE ALL** | Green breathing | All BLE connections | Cycles through all 40 BLE data + advertising channels (even nRF24 channels 2-80). Radios offset by 20 channels. |
+| 5 | **BLE ADV** | Yellow breathing | BLE control disruption | Both radios rapid-cycle the 3 BLE advertising channels (2402/2426/2480 MHz). Most effective at disrupting BLE device discovery and control connections. |
+| 6 | **CONSTANT CARRIER** | Red breathing | Baseline / antenna testing | Both radios output continuous carrier on channel 45 (2447 MHz). Used to verify RF output. |
 
-All modes except CONSTANT CARRIER use **continuous wave (CW) with 130 us PLL dwell** — the carrier never stops transmitting, it just retunes frequency each hop. WiFi raw TX runs independently on all modes, adding 20 MHz wideband interference on WiFi channels 1, 6, and 11.
+All hopping modes use **continuous wave (CW) with 130 us PLL dwell** — the carrier never stops, it just retunes frequency each hop. WiFi raw TX (20 MHz wideband on ch 1/6/11) runs independently on all modes.
 
 ---
 

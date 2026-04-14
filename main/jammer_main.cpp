@@ -33,9 +33,20 @@
 #include "RF24.h"
 #include "nRF24L01.h"
 
+// NimBLE — used for BLE device discovery scan at startup
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+
 // WiFi raw TX as 3rd wideband transmitter (20 MHz bandwidth >> nRF24's 2 MHz)
 static void init_wifi_jammer(void);
 static void wifi_jam_task(void* arg);
+
+// BLE device discovery (runs once at startup, before jamming)
+static void ble_discovery_scan(void);
 
 // Beacon frame: 20 MHz wideband energy on the selected WiFi channel
 static const uint8_t s_beacon_frame[] = {
@@ -106,8 +117,7 @@ static uint32_t s_last_press_duration_ms = 0;
 // Lonely Binary ESP32-S3 2520V5 N16R8: built-in WS2812 RGB LED on GPIO 48
 #define WS2812_GPIO     48
 #define RMT_RESOLUTION  10000000
-#define RAINBOW_MS_SLOW  80   // slow rainbow when jamming (e.g. constant carrier)
-#define RAINBOW_MS_FAST  18   // faster rainbow in cycle/sweep modes
+#define LED_BREATH_STEP_MS  15  // delay per brightness step in breathing animation
 
 // ============== JAMMER CONFIGURATION ==============
 #define MIN_CHANNEL   0
@@ -133,12 +143,13 @@ static inline uint8_t rand_channel(void) {
 }
 
 enum JammerMode {
-    MODE_BARRAGE,           // CW random-hop all 80 ch, 130µs PLL dwell, 100% RF duty
-    MODE_BLE_ADV_BARRAGE,   // R1=BLE adv ch (control plane) + R2=random (data plane)
-    MODE_BT_CLASSIC,        // CW sequential sweep ch 2-80, 130µs dwell
-    MODE_BLE_ALL,           // even channels 2-80 (all 40 BLE data+adv channels)
-    MODE_BLE_ADV,           // channels 2, 26, 80 only (BLE advertising priority)
-    MODE_CONSTANT_CARRIER,  // CW on ch 45 (baseline test)
+    MODE_BARRAGE,           // LED: slow rainbow    | random hop all 80 ch
+    MODE_BLE_ADV_BARRAGE,   // LED: cyan breath     | R1=adv ctrl + R2=random data
+    MODE_PERCEPTIVE,        // LED: magenta breath   | R1=adv+random interleave, R2=barrage
+    MODE_BT_CLASSIC,        // LED: blue breath     | sequential sweep ch 2-80
+    MODE_BLE_ALL,           // LED: green breath    | all 40 BLE channels
+    MODE_BLE_ADV,           // LED: yellow breath   | ch 2,26,80 rapid cycle
+    MODE_CONSTANT_CARRIER,  // LED: red breath      | CW on ch 45 (baseline test)
     MODE_COUNT
 };
 
@@ -151,6 +162,7 @@ static bool sweep_dir2 = true;
 static uint8_t ble_idx1 = 0;
 static uint8_t ble_idx2 = 20;
 static uint8_t ble_adv_idx = 0;
+static uint8_t perceptive_cycle = 0;
 
 static volatile bool s_jamming_active = false;
 
@@ -169,6 +181,7 @@ static void configure_radio_for_tx(RF24& radio);
 static void hop_carrier(RF24& radio, uint8_t channel);
 static void jam_barrage(void);
 static void jam_ble_adv_barrage(void);
+static void jam_perceptive(void);
 static void jam_bt_classic(void);
 static void jam_ble_all(void);
 static void jam_ble_adv(void);
@@ -197,6 +210,9 @@ extern "C" void app_main(void)
 
     LOG_INIT("WiFi raw TX (3rd transmitter, 20 MHz wideband)...");
     init_wifi_jammer();
+
+    LOG_INIT("BLE device discovery (startup scan)...");
+    ble_discovery_scan();
 
     LOG_INIT("Button GPIO %d (short=toggle jam, long=cycle mode)", BUTTON_PIN);
     gpio_config_t io = {};
@@ -316,24 +332,63 @@ static void init_rgb_led(void)
     set_rgb_led(0, 0, 0);
 }
 
+// Per-mode LED color (R, G, B at full brightness).
+// BARRAGE uses rainbow (hue cycling), all others use a fixed color with breathing.
+static void get_mode_color(JammerMode mode, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    switch (mode) {
+        case MODE_BLE_ADV_BARRAGE:  *r =   0; *g = 200; *b = 200; break; // cyan
+        case MODE_PERCEPTIVE:       *r = 200; *g =   0; *b = 200; break; // magenta
+        case MODE_BT_CLASSIC:       *r =   0; *g =   0; *b = 200; break; // blue
+        case MODE_BLE_ALL:          *r =   0; *g = 200; *b =   0; break; // green
+        case MODE_BLE_ADV:          *r = 200; *g = 200; *b =   0; break; // yellow
+        case MODE_CONSTANT_CARRIER: *r = 200; *g =   0; *b =   0; break; // red
+        default:                    *r = 200; *g = 200; *b = 200; break; // white fallback
+    }
+}
+
 static void rainbow_led_task(void* arg)
 {
     (void)arg;
     uint32_t hue = 0;
-    const uint8_t sat = 255;
-    const uint8_t val = 200;
+    uint8_t breath = 0;
+    bool breath_up = true;
+
     for (;;) {
         if (!s_jamming_active) {
-            set_rgb_led(0, 0, 0);  // LED off when jamming stopped
-            vTaskDelay(pdMS_TO_TICKS(RAINBOW_MS_SLOW));
+            set_rgb_led(0, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            breath = 0;
+            breath_up = true;
             continue;
         }
-        uint32_t delay_ms = (currentMode == MODE_CONSTANT_CARRIER) ? RAINBOW_MS_SLOW : RAINBOW_MS_FAST;
-        uint8_t r, g, b;
-        hsv_to_rgb(hue % 360, sat, val, &r, &g, &b);
-        set_rgb_led(r, g, b);
-        hue += 3;
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+
+        if (currentMode == MODE_BARRAGE) {
+            // Slow rainbow cycle for barrage
+            uint8_t r, g, b;
+            hsv_to_rgb(hue % 360, 255, 180, &r, &g, &b);
+            set_rgb_led(r, g, b);
+            hue += 2;
+            vTaskDelay(pdMS_TO_TICKS(60));
+        } else {
+            // Breathing animation: brightness ramps 0 → 200 → 0
+            uint8_t base_r, base_g, base_b;
+            get_mode_color(currentMode, &base_r, &base_g, &base_b);
+
+            uint8_t r = (uint8_t)((uint16_t)base_r * breath / 200);
+            uint8_t g = (uint8_t)((uint16_t)base_g * breath / 200);
+            uint8_t b = (uint8_t)((uint16_t)base_b * breath / 200);
+            set_rgb_led(r, g, b);
+
+            if (breath_up) {
+                if (breath >= 200) breath_up = false;
+                else               breath += 2;
+            } else {
+                if (breath <= 2)   breath_up = true;
+                else               breath -= 2;
+            }
+            vTaskDelay(pdMS_TO_TICKS(LED_BREATH_STEP_MS));
+        }
     }
 }
 
@@ -381,6 +436,109 @@ static void wifi_jam_task(void* arg)
 
         vTaskDelay(1);
     }
+}
+
+// ---------- BLE device discovery: one-shot scan at startup ----------
+
+static volatile bool s_ble_scan_done = false;
+static volatile bool s_ble_synced = false;
+
+static int ble_disc_gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        const struct ble_gap_disc_desc *desc = &event->disc;
+        char addr_str[18];
+        snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 desc->addr.val[5], desc->addr.val[4], desc->addr.val[3],
+                 desc->addr.val[2], desc->addr.val[1], desc->addr.val[0]);
+
+        const char *name = "(unknown)";
+        char name_buf[32] = {0};
+        struct ble_hs_adv_fields fields;
+        if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0
+            && fields.name != NULL && fields.name_len > 0) {
+            uint8_t copy_len = fields.name_len < sizeof(name_buf) - 1
+                             ? fields.name_len : (uint8_t)(sizeof(name_buf) - 1);
+            memcpy(name_buf, fields.name, copy_len);
+            name_buf[copy_len] = '\0';
+            name = name_buf;
+        }
+
+        LOG_BLE("FOUND  %s  rssi=%d  name=\"%s\"", addr_str, (int)desc->rssi, name);
+    } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
+        s_ble_scan_done = true;
+    }
+    return 0;
+}
+
+static void ble_disc_on_sync(void)
+{
+    ble_hs_util_ensure_addr(0);
+    s_ble_synced = true;
+}
+
+static void ble_disc_on_reset(int reason)
+{
+    (void)reason;
+    s_ble_synced = false;
+}
+
+static void ble_disc_host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    vTaskDelete(NULL);
+}
+
+static void ble_discovery_scan(void)
+{
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+
+    esp_err_t ret = nimble_port_init();
+    if (ret != ESP_OK) {
+        LOG_WRN("NimBLE init failed (%s) — skipping BLE discovery", esp_err_to_name(ret));
+        return;
+    }
+
+    ble_hs_cfg.reset_cb = ble_disc_on_reset;
+    ble_hs_cfg.sync_cb  = ble_disc_on_sync;
+    ble_svc_gap_init();
+    ble_svc_gap_device_name_set("scanner");
+
+    nimble_port_freertos_init(ble_disc_host_task);
+
+    for (int i = 0; i < 40 && !s_ble_synced; i++)
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (!s_ble_synced) {
+        LOG_WRN("NimBLE did not sync — skipping BLE discovery");
+        nimble_port_stop();
+        nimble_port_deinit();
+        return;
+    }
+
+    LOG_BLE("Scanning for nearby BLE devices (3 seconds)...");
+
+    struct ble_gap_disc_params scan_params = {};
+    scan_params.passive = 1;
+    scan_params.itvl = 0x0010;
+    scan_params.window = 0x0010;
+    scan_params.filter_duplicates = 1;
+
+    s_ble_scan_done = false;
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, 3000, &scan_params,
+                          ble_disc_gap_event, NULL);
+    if (rc != 0) {
+        LOG_WRN("BLE scan start failed (rc=%d)", rc);
+    } else {
+        while (!s_ble_scan_done)
+            vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    LOG_BLE("Discovery complete.");
+    nimble_port_stop();
+    nimble_port_deinit();
 }
 
 static void log_nrf24_spi_probe(const char* bus_name, SPI& spi)
@@ -575,6 +733,7 @@ static void jam_task(void* arg)
             sweep_dir1 = true; sweep_dir2 = true;
             ble_idx1 = 0; ble_idx2 = 20;
             ble_adv_idx = 0;
+            perceptive_cycle = 0;
             if (!was_active) {
                 LOG_JAM("Radios active | R1=%s R2=%s",
                         radio1.isChipConnected() ? "ok" : "FAIL",
@@ -586,6 +745,7 @@ static void jam_task(void* arg)
         switch (currentMode) {
             case MODE_BARRAGE:          jam_barrage(); break;
             case MODE_BLE_ADV_BARRAGE:  jam_ble_adv_barrage(); break;
+            case MODE_PERCEPTIVE:       jam_perceptive(); break;
             case MODE_BT_CLASSIC:       jam_bt_classic(); break;
             case MODE_BLE_ALL:          jam_ble_all(); break;
             case MODE_BLE_ADV:          jam_ble_adv(); break;
@@ -680,7 +840,27 @@ static void jam_ble_adv(void)
     ble_adv_idx = (ble_adv_idx + 1) % 3;
 }
 
-// MODE 4: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
+// ---------- MODE: PERCEPTIVE — multi-vector aggressive targeting ----------
+// Combines all effective attack vectors in a single mode:
+//   Radio 1: interleaves BLE adv channels (control plane disruption) with
+//            random barrage hops (data plane disruption) in a 1:3 ratio.
+//   Radio 2: pure random barrage across all 80 channels.
+// The interleaving means R1 hits an adv channel every 4th hop, keeping
+// sustained pressure on the BLE control connection while also contributing
+// to data-plane coverage. WiFi TX runs independently as always.
+static void jam_perceptive(void)
+{
+    if ((perceptive_cycle & 0x03) == 0) {
+        hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
+        ble_adv_idx = (ble_adv_idx + 1) % 3;
+    } else {
+        hop_carrier(radio1, rand_channel());
+    }
+    perceptive_cycle++;
+    hop_carrier(radio2, rand_channel());
+}
+
+// MODE 6: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
 static void jam_constant_carrier(void)
 {
     hop_carrier(radio1, 45);
@@ -691,12 +871,13 @@ static void print_mode(void)
 {
     const char* modeStr = "UNKNOWN";
     switch (currentMode) {
-        case MODE_BARRAGE:          modeStr = "BARRAGE (CW random hop, 130us PLL dwell)"; break;
-        case MODE_BLE_ADV_BARRAGE:  modeStr = "ADV+BARRAGE (R1=adv ctrl, R2=random data — best for audio)"; break;
-        case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC (CW sweep, 130us dwell)"; break;
-        case MODE_BLE_ALL:          modeStr = "BLE ALL (40 ch data+adv)"; break;
-        case MODE_BLE_ADV:          modeStr = "BLE ADV (ch 2,26,80 sustained dwell)"; break;
-        case MODE_CONSTANT_CARRIER: modeStr = "CONSTANT CARRIER (ch 45)"; break;
+        case MODE_BARRAGE:          modeStr = "BARRAGE [rainbow] random hop all 80ch"; break;
+        case MODE_BLE_ADV_BARRAGE:  modeStr = "ADV+BARRAGE [cyan] R1=adv ctrl, R2=random"; break;
+        case MODE_PERCEPTIVE:       modeStr = "PERCEPTIVE [magenta] R1=adv+random, R2=barrage"; break;
+        case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC [blue] sweep ch 2-80"; break;
+        case MODE_BLE_ALL:          modeStr = "BLE ALL [green] 40 BLE channels"; break;
+        case MODE_BLE_ADV:          modeStr = "BLE ADV [yellow] ch 2,26,80 rapid"; break;
+        case MODE_CONSTANT_CARRIER: modeStr = "CONSTANT CARRIER [red] ch 45 test"; break;
         default: break;
     }
     LOG_MODE("Current: %s", modeStr);
