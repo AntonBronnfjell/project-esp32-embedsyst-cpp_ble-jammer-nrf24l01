@@ -145,7 +145,7 @@ static inline uint8_t rand_channel(void) {
 enum JammerMode {
     MODE_BARRAGE,           // LED: slow rainbow    | random hop all 80 ch
     MODE_BLE_ADV_BARRAGE,   // LED: cyan breath     | R1=adv ctrl + R2=random data
-    MODE_PERCEPTIVE,        // LED: magenta breath   | R1=adv+random interleave, R2=barrage
+    MODE_TRACKING,          // LED: white breath     | concentrated 10-ch window sweep
     MODE_BT_CLASSIC,        // LED: blue breath     | sequential sweep ch 2-80
     MODE_BLE_ALL,           // LED: green breath    | all 40 BLE channels
     MODE_BLE_ADV,           // LED: yellow breath   | ch 2,26,80 rapid cycle
@@ -162,7 +162,10 @@ static bool sweep_dir2 = true;
 static uint8_t ble_idx1 = 0;
 static uint8_t ble_idx2 = 20;
 static uint8_t ble_adv_idx = 0;
-static uint8_t perceptive_cycle = 0;
+#define TRACKING_WINDOW_SIZE  10
+#define TRACKING_WINDOW_ITERS 3300
+static uint8_t tracking_window_base = 0;
+static uint32_t tracking_window_count = 0;
 
 static volatile bool s_jamming_active = false;
 
@@ -181,7 +184,7 @@ static void configure_radio_for_tx(RF24& radio);
 static void hop_carrier(RF24& radio, uint8_t channel);
 static void jam_barrage(void);
 static void jam_ble_adv_barrage(void);
-static void jam_perceptive(void);
+static void jam_tracking(void);
 static void jam_bt_classic(void);
 static void jam_ble_all(void);
 static void jam_ble_adv(void);
@@ -338,7 +341,7 @@ static void get_mode_color(JammerMode mode, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     switch (mode) {
         case MODE_BLE_ADV_BARRAGE:  *r =   0; *g = 200; *b = 200; break; // cyan
-        case MODE_PERCEPTIVE:       *r = 200; *g =   0; *b = 200; break; // magenta
+        case MODE_TRACKING:         *r = 200; *g = 200; *b = 200; break; // white
         case MODE_BT_CLASSIC:       *r =   0; *g =   0; *b = 200; break; // blue
         case MODE_BLE_ALL:          *r =   0; *g = 200; *b =   0; break; // green
         case MODE_BLE_ADV:          *r = 200; *g = 200; *b =   0; break; // yellow
@@ -733,7 +736,8 @@ static void jam_task(void* arg)
             sweep_dir1 = true; sweep_dir2 = true;
             ble_idx1 = 0; ble_idx2 = 20;
             ble_adv_idx = 0;
-            perceptive_cycle = 0;
+            tracking_window_base = 0;
+            tracking_window_count = 0;
             if (!was_active) {
                 LOG_JAM("Radios active | R1=%s R2=%s",
                         radio1.isChipConnected() ? "ok" : "FAIL",
@@ -745,7 +749,7 @@ static void jam_task(void* arg)
         switch (currentMode) {
             case MODE_BARRAGE:          jam_barrage(); break;
             case MODE_BLE_ADV_BARRAGE:  jam_ble_adv_barrage(); break;
-            case MODE_PERCEPTIVE:       jam_perceptive(); break;
+            case MODE_TRACKING:         jam_tracking(); break;
             case MODE_BT_CLASSIC:       jam_bt_classic(); break;
             case MODE_BLE_ALL:          jam_ble_all(); break;
             case MODE_BLE_ADV:          jam_ble_adv(); break;
@@ -840,24 +844,29 @@ static void jam_ble_adv(void)
     ble_adv_idx = (ble_adv_idx + 1) % 3;
 }
 
-// ---------- MODE: PERCEPTIVE — multi-vector aggressive targeting ----------
-// Combines all effective attack vectors in a single mode:
-//   Radio 1: interleaves BLE adv channels (control plane disruption) with
-//            random barrage hops (data plane disruption) in a 1:3 ratio.
-//   Radio 2: pure random barrage across all 80 channels.
-// The interleaving means R1 hits an adv channel every 4th hop, keeping
-// sustained pressure on the BLE control connection while also contributing
-// to data-plane coverage. WiFi TX runs independently as always.
-static void jam_perceptive(void)
+// ---------- MODE: TRACKING — concentrated window sweep ----------
+// Both radios focus on a 10-channel window, hopping randomly within it.
+// The window slides by 10 channels every ~500 ms, sweeping the full
+// spectrum every ~4 seconds. Within each window the hit rate per channel
+// is 20% (2 radios / 10 channels) — 8x more concentrated than barrage.
+// AFH needs 1-8 seconds to blacklist channels, so the window moves
+// before the target device can fully adapt.
+static void jam_tracking(void)
 {
-    if ((perceptive_cycle & 0x03) == 0) {
-        hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
-        ble_adv_idx = (ble_adv_idx + 1) % 3;
-    } else {
-        hop_carrier(radio1, rand_channel());
+    uint8_t lo = tracking_window_base;
+    uint8_t hi = lo + TRACKING_WINDOW_SIZE - 1;
+    if (hi > MAX_CHANNEL) hi = MAX_CHANNEL;
+
+    uint8_t range = hi - lo + 1;
+    hop_carrier(radio1, lo + (xorshift32() % range));
+    hop_carrier(radio2, lo + (xorshift32() % range));
+
+    if (++tracking_window_count >= TRACKING_WINDOW_ITERS) {
+        tracking_window_count = 0;
+        tracking_window_base += TRACKING_WINDOW_SIZE;
+        if (tracking_window_base > MAX_CHANNEL)
+            tracking_window_base = 0;
     }
-    perceptive_cycle++;
-    hop_carrier(radio2, rand_channel());
 }
 
 // MODE 6: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
@@ -873,7 +882,7 @@ static void print_mode(void)
     switch (currentMode) {
         case MODE_BARRAGE:          modeStr = "BARRAGE [rainbow] random hop all 80ch"; break;
         case MODE_BLE_ADV_BARRAGE:  modeStr = "ADV+BARRAGE [cyan] R1=adv ctrl, R2=random"; break;
-        case MODE_PERCEPTIVE:       modeStr = "PERCEPTIVE [magenta] R1=adv+random, R2=barrage"; break;
+        case MODE_TRACKING:         modeStr = "TRACKING [white] 10-ch window sweep, 8x concentrated"; break;
         case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC [blue] sweep ch 2-80"; break;
         case MODE_BLE_ALL:          modeStr = "BLE ALL [green] 40 BLE channels"; break;
         case MODE_BLE_ADV:          modeStr = "BLE ADV [yellow] ch 2,26,80 rapid"; break;

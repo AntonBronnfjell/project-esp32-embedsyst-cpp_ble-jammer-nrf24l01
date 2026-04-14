@@ -64,7 +64,7 @@ The jammer boots in **BARRAGE** mode and cycles through the following modes on e
 |---|------|-----|----------|-------------|
 | 0 | **BARRAGE** | Slow rainbow | BLE devices (mice, keyboards) | Both radios randomly hop all 80 channels with 130 us PLL dwell. 100% CW duty cycle. ~6600 hops/s per radio. |
 | 1 | **ADV+BARRAGE** | Cyan breathing | Audio devices (hybrid control+data attack) | R1 rapid-cycles BLE advertising channels (2, 26, 80) disrupting the control plane. R2 does random barrage across all channels hitting the data plane. |
-| 2 | **PERCEPTIVE** | Magenta breathing | Multi-vector aggressive targeting | R1 interleaves BLE adv channel hits (every 4th hop) with random barrage. R2 does pure random barrage. Combines control-plane pressure with full-spectrum coverage. BLE device discovery at startup logs nearby devices. |
+| 2 | **TRACKING** | White breathing | Concentrated regional attack | Both radios focus on a 10-channel window that slides across the spectrum every ~500ms. 20% hit rate per channel (8x more concentrated than barrage). Full spectrum swept every ~4s. BLE device discovery at startup. |
 | 3 | **BT CLASSIC** | Blue breathing | BT Classic data connections | Sequential CW sweep across all 79 BT Classic channels (nRF24 ch 2-80). Radios sweep in opposite directions for maximum coverage. |
 | 4 | **BLE ALL** | Green breathing | All BLE connections | Cycles through all 40 BLE data + advertising channels (even nRF24 channels 2-80). Radios offset by 20 channels. |
 | 5 | **BLE ADV** | Yellow breathing | BLE control disruption | Both radios rapid-cycle the 3 BLE advertising channels (2402/2426/2480 MHz). Most effective at disrupting BLE device discovery and control connections. |

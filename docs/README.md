@@ -109,17 +109,31 @@ Replace `PORT` with your serial port (e.g. `/dev/tty.usbserial-*` or `COM3`). Af
 
 ## Usage
 
-- **Short press** (button on GPIO 35): toggle jamming on/off. LED reflects state (rainbow = active, off = idle).
+- **Short press** (button on GPIO 35): toggle jamming on/off.
 - **Long press** (~800 ms): cycle to the next jamming mode.
 - Jammer starts in BARRAGE mode on boot with jamming active.
+- At startup, a 3-second BLE discovery scan logs nearby devices (MAC, name, RSSI) to serial.
 
-**LED behavior:** Rainbow pattern while jamming (slower in constant carrier mode, faster in hopping modes); off when jamming is stopped.
+### LED indicator
+
+Each mode has a distinct LED color for at-a-glance identification:
+
+| Mode | LED Color | Animation |
+|------|-----------|-----------|
+| BARRAGE | Rainbow | Slow hue cycle |
+| ADV+BARRAGE | Cyan | Breathing (fade in/out) |
+| TRACKING | White | Breathing |
+| BT CLASSIC | Blue | Breathing |
+| BLE ALL | Green | Breathing |
+| BLE ADV | Yellow | Breathing |
+| CONSTANT CARRIER | Red | Breathing |
+| Jamming OFF | Off | — |
 
 ---
 
 ## Jamming modes — detailed reference
 
-The jammer cycles through six modes on each long press. Each mode uses continuous wave (CW) transmission from the NRF24 modules (100% RF duty cycle — the carrier never stops) combined with ESP32 WiFi raw TX (20 MHz wideband on channels 1/6/11).
+The jammer cycles through seven modes on each long press. All hopping modes use continuous wave (CW) transmission from the NRF24 modules (100% RF duty cycle — the carrier never stops) combined with ESP32 WiFi raw TX (20 MHz wideband on channels 1/6/11).
 
 ### Mode 0: BARRAGE
 
@@ -145,7 +159,24 @@ This is a dual-attack mode. Radio 1 rapid-cycles the three BLE advertising chann
 
 ---
 
-### Mode 2: BT CLASSIC
+### Mode 2: TRACKING
+
+**Best for:** Concentrated regional interference, overcoming Adaptive Frequency Hopping.
+
+Both radios focus on a narrow 10-channel window, hopping randomly within it. The window slides by 10 channels every ~500 ms (3300 iterations), sweeping the full 80-channel spectrum every ~4 seconds.
+
+**How it works technically:** Instead of spreading 2 radios across 80 channels (2.5% hit rate), TRACKING concentrates both radios on 10 channels at a time — a 20% hit rate per channel, 8x more concentrated than barrage. The window slides before AFH can fully adapt (AFH needs 1-8 seconds to detect and blacklist channels). When the window circles back, previously blacklisted channels may have been un-blacklisted (requires 8 consecutive clean scans to unblock), so they get hit again.
+
+**Math comparison:**
+- Barrage: 2 radios / 80 channels = 2.5% per hop
+- Tracking: 2 radios / 10 channels = 20% per hop (8x improvement)
+- Full spectrum coverage: ~4 seconds per cycle
+
+**Tradeoff:** Takes 4 seconds to cover the full spectrum vs barrage's instant-but-thin coverage. During each 500 ms window, the interference on those 10 channels is dramatically stronger.
+
+---
+
+### Mode 3: BT CLASSIC
 
 **Best for:** Testing BT Classic vulnerability, sequential spectrum coverage analysis.
 
@@ -157,7 +188,7 @@ Both radios perform a sequential sweep across all 79 BT Classic FHSS data channe
 
 ---
 
-### Mode 3: BLE ALL
+### Mode 4: BLE ALL
 
 **Best for:** Comprehensive BLE disruption, testing BLE data channel resilience.
 
@@ -167,7 +198,7 @@ Both radios cycle through all 40 BLE data and advertising channels (even nRF24 c
 
 ---
 
-### Mode 4: BLE ADV
+### Mode 5: BLE ADV
 
 **Best for:** BLE device discovery disruption, preventing new BLE connections, control channel attacks.
 
@@ -179,7 +210,7 @@ Both radios rapid-cycle across the three BLE advertising channels: channel 37 (2
 
 ---
 
-### Mode 5: CONSTANT CARRIER
+### Mode 6: CONSTANT CARRIER
 
 **Best for:** Baseline RF output testing, antenna verification, single-channel interference analysis.
 
