@@ -162,10 +162,7 @@ static bool sweep_dir2 = true;
 static uint8_t ble_idx1 = 0;
 static uint8_t ble_idx2 = 20;
 static uint8_t ble_adv_idx = 0;
-#define TRACKING_WINDOW_SIZE  10
-#define TRACKING_WINDOW_ITERS 3300
-static uint8_t tracking_window_base = 0;
-static uint32_t tracking_window_count = 0;
+static uint8_t tracking_cycle = 0;
 
 static volatile bool s_jamming_active = false;
 
@@ -736,8 +733,7 @@ static void jam_task(void* arg)
             sweep_dir1 = true; sweep_dir2 = true;
             ble_idx1 = 0; ble_idx2 = 20;
             ble_adv_idx = 0;
-            tracking_window_base = 0;
-            tracking_window_count = 0;
+            tracking_cycle = 0;
             if (!was_active) {
                 LOG_JAM("Radios active | R1=%s R2=%s",
                         radio1.isChipConnected() ? "ok" : "FAIL",
@@ -844,29 +840,24 @@ static void jam_ble_adv(void)
     ble_adv_idx = (ble_adv_idx + 1) % 3;
 }
 
-// ---------- MODE: TRACKING — concentrated window sweep ----------
-// Both radios focus on a 10-channel window, hopping randomly within it.
-// The window slides by 10 channels every ~500 ms, sweeping the full
-// spectrum every ~4 seconds. Within each window the hit rate per channel
-// is 20% (2 radios / 10 channels) — 8x more concentrated than barrage.
-// AFH needs 1-8 seconds to blacklist channels, so the window moves
-// before the target device can fully adapt.
+// ---------- MODE: TRACKING — aggressive dual-vector attack ----------
+// Both radios alternate between BLE adv channels and random barrage
+// in a 1:1 ratio. This doubles the BLE control-plane pressure compared
+// to ADV+BARRAGE (both radios hit adv channels, not just R1) while
+// maintaining data-plane coverage on alternating hops.
+// Pattern: R1=adv,R2=random → R1=random,R2=adv → repeat
 static void jam_tracking(void)
 {
-    uint8_t lo = tracking_window_base;
-    uint8_t hi = lo + TRACKING_WINDOW_SIZE - 1;
-    if (hi > MAX_CHANNEL) hi = MAX_CHANNEL;
-
-    uint8_t range = hi - lo + 1;
-    hop_carrier(radio1, lo + (xorshift32() % range));
-    hop_carrier(radio2, lo + (xorshift32() % range));
-
-    if (++tracking_window_count >= TRACKING_WINDOW_ITERS) {
-        tracking_window_count = 0;
-        tracking_window_base += TRACKING_WINDOW_SIZE;
-        if (tracking_window_base > MAX_CHANNEL)
-            tracking_window_base = 0;
+    if (tracking_cycle & 1) {
+        hop_carrier(radio1, rand_channel());
+        hop_carrier(radio2, ble_adv_channels[ble_adv_idx]);
+        ble_adv_idx = (ble_adv_idx + 1) % 3;
+    } else {
+        hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
+        ble_adv_idx = (ble_adv_idx + 1) % 3;
+        hop_carrier(radio2, rand_channel());
     }
+    tracking_cycle++;
 }
 
 // MODE 6: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
@@ -882,7 +873,7 @@ static void print_mode(void)
     switch (currentMode) {
         case MODE_BARRAGE:          modeStr = "BARRAGE [rainbow] random hop all 80ch"; break;
         case MODE_BLE_ADV_BARRAGE:  modeStr = "ADV+BARRAGE [cyan] R1=adv ctrl, R2=random"; break;
-        case MODE_TRACKING:         modeStr = "TRACKING [white] 10-ch window sweep, 8x concentrated"; break;
+        case MODE_TRACKING:         modeStr = "TRACKING [white] both radios alternate adv+barrage"; break;
         case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC [blue] sweep ch 2-80"; break;
         case MODE_BLE_ALL:          modeStr = "BLE ALL [green] 40 BLE channels"; break;
         case MODE_BLE_ADV:          modeStr = "BLE ADV [yellow] ch 2,26,80 rapid"; break;
