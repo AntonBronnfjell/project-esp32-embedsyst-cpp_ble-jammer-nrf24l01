@@ -8,9 +8,16 @@
  * testing your own equipment's vulnerability ONLY.
  *
  * Three transmitters:
- *   NRF24 #1 — CW (continuous wave) with 130 µs PLL dwell per hop
- *   NRF24 #2 — CW (continuous wave) with 130 µs PLL dwell per hop
+ *   NRF24 #1 — CW (continuous wave) with configurable PLL dwell per hop
+ *   NRF24 #2 — CW (continuous wave) with configurable PLL dwell per hop
  *   ESP32 WiFi TX — 20 MHz wideband raw beacon frames on ch 1/6/11
+ *
+ * Hardware note (original brand vs module):
+ *   The 2.4 GHz transceiver IC is the nRF24L01+ from Nordic Semiconductor (Norway).
+ *   Breakout/PA+LNA boards are built by many vendors; cheap modules often use
+ *   compatible clones (e.g. Si24R1) or counterfeit Nordic-marked dies — see
+ *   Nordic DevZone and Hackaday “Real vs Fake nRF24L01+”. Poor regulation,
+ *   weak external PAs, or antenna issues limit range more than firmware.
  */
 
 #include <cstdio>
@@ -92,6 +99,25 @@ static uint32_t s_last_press_duration_ms = 0;
 
 // Lower this (e.g. 1_000_000) if SPI probe shows garbage but wiring looks correct (long wires / breadboard).
 #define JAMMER_NRF24_SPI_HZ 10000000
+
+// --- nRF24 RF tuning (same physical hardware; adjust if effectiveness/range is marginal) ---
+// Nordic nRF24L01+ product spec: PLL typically locks in ~130 µs after RF_CH change; cheap modules
+// sometimes benefit from a slightly longer settle before the next hop (cleaner carrier, fewer
+// “missed” frequencies). RF24 scanner examples use 130 µs.
+#ifndef JAMMER_NRF24_PLL_SETTLE_US
+#define JAMMER_NRF24_PLL_SETTLE_US 150
+#endif
+// Chip output level before your board’s PA+LNA. RF24_PA_MAX is default; on some clone PA+LNA
+// boards the last stage compresses — try RF24_PA_HIGH for a cleaner drive into the PA (less
+// splatter, occasionally better perceived range than overdriven PA_MAX).
+#ifndef JAMMER_NRF24_PA_LEVEL
+#define JAMMER_NRF24_PA_LEVEL RF24_PA_MAX
+#endif
+// RF24::setPALevel(level, lnaEnable): second bit is the Si24R1 “extra power” LSB; leave 1 for
+// typical AliExpress PA+LNA boards. Use 0 if you know you have a genuine Nordic-only module.
+#ifndef JAMMER_NRF24_PALEVEL_LNA_BIT
+#define JAMMER_NRF24_PALEVEL_LNA_BIT 1
+#endif
 
 // ============== ESP32-S3 PIN CONFIGURATION ==============
 // NOTE: ESP32-S3 has NO GPIO 22, 23, 24, 25 (only 0-21 and 26-48).
@@ -414,7 +440,8 @@ static void init_wifi_jammer(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
-    esp_wifi_set_max_tx_power(80);
+    /* ESP-IDF: power is in 0.25 dBm steps, range [8, 84] → up to ~20 dBm where PHY allows */
+    (void)esp_wifi_set_max_tx_power(84);
 
     xTaskCreatePinnedToCore(wifi_jam_task, "wifi_jam", 4096, NULL, 5, NULL, 0);
     LOG_INIT("WiFi raw TX started (3rd transmitter, built-in antenna)");
@@ -623,7 +650,7 @@ static void init_nrf24_modules(void)
             vTaskDelay(pdMS_TO_TICKS(2));
 
             radio1.stopListening();
-            radio1.startConstCarrier(RF24_PA_MAX, test_ch);
+            radio1.startConstCarrier(JAMMER_NRF24_PA_LEVEL, test_ch);
             vTaskDelay(pdMS_TO_TICKS(dwell_ms));
 
             rpd_r2 = radio2.testRPD();
@@ -653,7 +680,7 @@ static void init_nrf24_modules(void)
             vTaskDelay(pdMS_TO_TICKS(2));
 
             radio2.stopListening();
-            radio2.startConstCarrier(RF24_PA_MAX, test_ch);
+            radio2.startConstCarrier(JAMMER_NRF24_PA_LEVEL, test_ch);
             vTaskDelay(pdMS_TO_TICKS(dwell_ms));
 
             rpd_r1 = radio1.testRPD();
@@ -682,7 +709,8 @@ static void init_nrf24_modules(void)
     if (module1_ok) configure_radio_for_tx(radio1);
     if (module2_ok) configure_radio_for_tx(radio2);
 
-    LOG_INIT("NRF24 CW config: AutoAck=OFF, PA=MAX, 2Mbps, CRC=OFF, 130us PLL dwell");
+    LOG_INIT("NRF24 CW: AutoAck=OFF PA=%d LNAbit=%d 2Mbps CRC=OFF PLL=%dus (override via JAMMER_NRF24_* in jammer_main.cpp)",
+             (int)JAMMER_NRF24_PA_LEVEL, JAMMER_NRF24_PALEVEL_LNA_BIT, JAMMER_NRF24_PLL_SETTLE_US);
     if (module1_ok) { LOG_RF1("--- register dump ---"); radio1.printDetails(); }
     if (module2_ok) { LOG_RF2("--- register dump ---"); radio2.printDetails(); }
 
@@ -697,19 +725,19 @@ static void configure_radio_for_tx(RF24& radio)
     radio.stopListening();
     radio.setAutoAck(false);
     radio.setRetries(0, 0);
-    radio.setPALevel(RF24_PA_MAX, true);
+    radio.setPALevel(JAMMER_NRF24_PA_LEVEL, JAMMER_NRF24_PALEVEL_LNA_BIT != 0);
     radio.setDataRate(RF24_2MBPS);
     radio.setCRCLength(RF24_CRC_DISABLED);
-    radio.startConstCarrier(RF24_PA_MAX, 45);
+    radio.startConstCarrier(JAMMER_NRF24_PA_LEVEL, 45);
 }
 
 // CW hop: just retune the PLL. CE stays HIGH from startConstCarrier() so the
-// carrier never stops — 100% RF duty cycle. The 130 µs dwell lets the PLL
+// carrier never stops — 100% RF duty cycle. JAMMER_NRF24_PLL_SETTLE_US lets the PLL
 // lock on the new channel before we hop again.
 static void hop_carrier(RF24& radio, uint8_t channel)
 {
     radio.setChannel(channel);
-    esp_rom_delay_us(130);
+    esp_rom_delay_us(JAMMER_NRF24_PLL_SETTLE_US);
 }
 
 // Fast hop: NO PLL dwell. The PLL starts retuning but never locks before the
@@ -782,9 +810,9 @@ static void jam_task(void* arg)
     }
 }
 
-// MODE 0: BARRAGE — CW random hop across all 80 channels with 130 µs PLL dwell.
+// MODE 0: BARRAGE — CW random hop across all 80 channels with PLL dwell (see JAMMER_NRF24_PLL_SETTLE_US).
 // Both radios independent random = max unpredictability for AFH.
-// ~6600 hops/s per radio with CW always on (100% RF duty cycle).
+// CW always on (100% RF duty cycle); hop rate scales inversely with PLL dwell.
 static void jam_barrage(void)
 {
     hop_carrier(radio1, rand_channel());
@@ -794,7 +822,7 @@ static void jam_barrage(void)
 // MODE 1: STORM — dual-strategy interference (scientifically optimized).
 // Radio 1 "NOISE": no PLL dwell → PLL continuously sweeps between channels,
 //   creating broadband noise wider than the 2 kHz stable CW tone. ~50k hops/s.
-// Radio 2 "STRIKE": 130µs PLL dwell → stable CW at channel center frequency,
+// Radio 2 "STRIKE": PLL dwell (hop_carrier) → stable CW at channel center frequency,
 //   precise interference that corrupts GFSK demodulation. ~6600 hops/s.
 // Two complementary interference types that receivers can't optimize for both.
 static void jam_storm(void)
@@ -827,7 +855,7 @@ static const uint8_t bt_classic_channels[] = {
 };
 #define BT_CLASSIC_CH_COUNT (sizeof(bt_classic_channels) / sizeof(bt_classic_channels[0]))
 
-// MODE 1: BT CLASSIC — CW sequential sweep ch 2-80 with 130 µs PLL dwell.
+// MODE 1: BT CLASSIC — CW sequential sweep ch 2-80 with PLL dwell per hop.
 // Radios sweep in opposite directions for max coverage.
 static void jam_bt_classic(void)
 {
