@@ -4,6 +4,8 @@
 
 **Full documentation:** [docs/README.md](docs/README.md) — hardware pinouts, wiring, build, usage, power, and troubleshooting.
 
+**Receive-only tools:** [tools/](tools/) — a 2.4 GHz interference/jamming **detector** and a BLE **scanner** that reuse the same hardware without transmitting.
+
 ![Full system wiring](docs/images/wiring-full.png)
 
 ---
