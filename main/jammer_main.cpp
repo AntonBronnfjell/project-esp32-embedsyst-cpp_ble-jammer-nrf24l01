@@ -148,6 +148,56 @@ static uint32_t s_last_press_duration_ms = 0;
 // ============== JAMMER CONFIGURATION ==============
 #define MIN_CHANNEL   0
 #define MAX_CHANNEL  79
+
+// Number of raw 802.11 beacon frames sent on a WiFi channel before the
+// transmitter rotates to the next one (1 / 6 / 11).
+#ifndef JAMMER_WIFI_FRAMES_PER_CH
+#define JAMMER_WIFI_FRAMES_PER_CH 50
+#endif
+
+// ============== CHANNEL TABLES ==============
+// Every channel map lives in one place so the modes below stay readable.
+//
+// BLE advertising channels: ch37 = 2402 MHz -> nRF ch 2, ch38 = 2426 MHz -> ch 26,
+// ch39 = 2480 MHz -> ch 80.
+static const uint8_t ble_adv_channels[] = { 2, 26, 80 };
+
+// BLE: all 40 data + advertising channels (even nRF24 channels 2-80).
+static const uint8_t ble_all_channels[] = {
+     2,  4,  6,  8, 10, 12, 14, 16, 18, 20,
+    22, 24, 26, 28, 30, 32, 34, 36, 38, 40,
+    42, 44, 46, 48, 50, 52, 54, 56, 58, 60,
+    62, 64, 66, 68, 70, 72, 74, 76, 78, 80,
+};
+
+// BLE SIEGE: the same 40 BLE frequencies, ordered so each advertising channel
+// sits at its natural place in the sweep.
+static const uint8_t ble_siege_channels[] = {
+     2,                          // BLE adv ch37 (2402 MHz)
+     4,  6,  8, 10, 12, 14, 16, // BLE data ch0-6
+    18, 20, 22, 24,             // BLE data ch7-10
+    26,                          // BLE adv ch38 (2426 MHz)
+    28, 30, 32, 34, 36, 38, 40, // BLE data ch11-17
+    42, 44, 46, 48, 50, 52, 54, // BLE data ch18-24
+    56, 58, 60, 62, 64, 66, 68, // BLE data ch25-31
+    70, 72, 74, 76, 78,         // BLE data ch32-36
+    80,                          // BLE adv ch39 (2480 MHz)
+};
+
+// BT Classic: all 79 FHSS data channels (nRF24 ch 2-80).
+static const uint8_t bt_classic_channels[] = {
+     2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+    50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+    66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+};
+
+#define BLE_ADV_CH_COUNT    (sizeof(ble_adv_channels) / sizeof(ble_adv_channels[0]))
+#define BLE_ALL_CH_COUNT    (sizeof(ble_all_channels) / sizeof(ble_all_channels[0]))
+#define BLE_SIEGE_CH_COUNT  (sizeof(ble_siege_channels) / sizeof(ble_siege_channels[0]))
+#define BT_CLASSIC_CH_COUNT (sizeof(bt_classic_channels) / sizeof(bt_classic_channels[0]))
+
 // ============== GLOBAL VARIABLES ==============
 SPI spi0(SPI2_HOST);
 SPI spi1(SPI3_HOST);
@@ -168,11 +218,34 @@ static inline uint8_t rand_channel(void) {
     return (uint8_t)(xorshift32() % (MAX_CHANNEL + 1));
 }
 
+// Per-radio runtime state.
+//   present  — the module answered on SPI; a missing module is never touched
+//              again (no pointless SPI traffic, no bogus log spam).
+//   last_ch  — last channel commanded, so a repeated hop skips a redundant
+//              RF_CH write (CONSTANT CARRIER would otherwise re-write the
+//              register thousands of times per second).
+//   ch_valid — false after (re)configuration, when the channel register state
+//              is unknown and the next hop must write unconditionally.
+struct JamRadio {
+    RF24*    radio;
+    bool     present;
+    uint8_t  last_ch;
+    bool     ch_valid;
+    uint64_t* hops;      // per-radio hop counter (reported when jamming stops)
+};
+
+static uint64_t s_hops1 = 0;
+static uint64_t s_hops2 = 0;
+static uint32_t s_jam_start_ms = 0;
+
+static JamRadio g_r1 = { &radio1, false, 0, false, &s_hops1 };
+static JamRadio g_r2 = { &radio2, false, 0, false, &s_hops2 };
+
 enum JammerMode {
     MODE_BARRAGE,           // LED: slow rainbow    | random hop all 80 ch
     MODE_STORM,             // LED: purple breath   | R1=noise sweep + R2=CW strike
     MODE_BLE_ADV_BARRAGE,   // LED: cyan breath     | R1=adv ctrl + R2=random data
-    MODE_TRACKING,          // LED: white breath     | concentrated 10-ch window sweep
+    MODE_TRACKING,          // LED: white breath    | both radios alternate adv <-> barrage
     MODE_BT_CLASSIC,        // LED: blue breath     | sequential sweep ch 2-80
     MODE_BLE_ALL,           // LED: green breath    | all 40 BLE channels
     MODE_BLE_ADV,           // LED: yellow breath   | ch 2,26,80 rapid cycle
@@ -181,12 +254,38 @@ enum JammerMode {
     MODE_COUNT
 };
 
+// Single source of truth for the serial log and the LED: name, colour label
+// and one-line description for every mode. The table and the enum are kept
+// in sync by a static_assert below.
+struct ModeInfo {
+    const char* name;
+    const char* color;
+    const char* detail;
+    uint8_t r, g, b;
+};
+
+static const ModeInfo k_modes[] = {
+    { "BARRAGE",          "rainbow", "random hop all 80 ch",            200, 200, 200 },
+    { "STORM",            "purple", "R1=noise sweep, R2=CW strike",     150,   0, 200 },
+    { "ADV+BARRAGE",      "cyan",   "R1=adv ctrl, R2=random",             0, 200, 200 },
+    { "TRACKING",         "white",  "both radios alternate adv+barrage", 200, 200, 200 },
+    { "BT CLASSIC",       "blue",   "sweep ch 2-80",                      0,   0, 200 },
+    { "BLE ALL",          "green",  "40 BLE channels",                    0, 200,   0 },
+    { "BLE ADV",          "yellow", "ch 2,26,80 rapid",                 200, 200,   0 },
+    { "BLE SIEGE",        "orange", "all 40 BLE ch random (data+adv)",  200, 100,   0 },
+    { "CONSTANT CARRIER", "red",    "ch 45 test",                       200,   0,   0 },
+};
+
+constexpr int k_mode_count = (int)(sizeof(k_modes) / sizeof(k_modes[0]));
+static_assert((int)MODE_COUNT == k_mode_count, "mode table and enum are out of sync");
+
 static volatile JammerMode currentMode = MODE_BARRAGE;
 static volatile bool s_mode_changed = false;
-static uint8_t sweep_ch1 = 2;
-static uint8_t sweep_ch2 = 41;
+// Index into bt_classic_channels[] (NOT a channel number).
+static uint8_t sweep_idx1 = 0;
+static uint8_t sweep_idx2 = (uint8_t)(BT_CLASSIC_CH_COUNT / 2);
 static bool sweep_dir1 = true;
-static bool sweep_dir2 = true;
+static bool sweep_dir2 = false;
 static uint8_t ble_idx1 = 0;
 static uint8_t ble_idx2 = 20;
 static uint8_t ble_adv_idx = 0;
@@ -205,9 +304,9 @@ static rmt_encoder_handle_t s_led_encoder = nullptr;
 // ============== FUNCTION PROTOTYPES ==============
 static void init_nrf24_modules(void);
 static void log_nrf24_spi_probe(const char* bus_name, SPI& spi);
-static void configure_radio_for_tx(RF24& radio);
-static void hop_carrier(RF24& radio, uint8_t channel);
-static void hop_carrier_fast(RF24& radio, uint8_t channel);
+static void jam_radio_configure(JamRadio& r);
+static inline void jam_hop(JamRadio& r, uint8_t channel);
+static inline void jam_hop_fast(JamRadio& r, uint8_t channel);
 static void jam_barrage(void);
 static void jam_storm(void);
 static void jam_ble_adv_barrage(void);
@@ -311,8 +410,26 @@ static int check_button_event(void)
 
 static void stop_jamming_radios(void)
 {
-    radio1.powerDown();
-    radio2.powerDown();
+    if (g_r1.present) g_r1.radio->powerDown();
+    if (g_r2.present) g_r2.radio->powerDown();
+    g_r1.ch_valid = false;
+    g_r2.ch_valid = false;
+}
+
+// Session summary: how long the jammer ran and how many channel hops each
+// radio performed — handy when correlating a lab session with a spectrum
+// analyzer capture.
+static void log_session_stats(void)
+{
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t elapsed_ms = (s_jam_start_ms && now_ms >= s_jam_start_ms)
+                         ? (now_ms - s_jam_start_ms) : 0;
+    LOG_JAM("Session: %u ms | hops R1=%llu R2=%llu",
+            (unsigned)elapsed_ms,
+            (unsigned long long)s_hops1, (unsigned long long)s_hops2);
+    s_hops1 = 0;
+    s_hops2 = 0;
+    s_jam_start_ms = 0;
 }
 
 // ---------- Built-in RGB LED: rainbow only while jamming is active ----------
@@ -363,21 +480,15 @@ static void init_rgb_led(void)
     set_rgb_led(0, 0, 0);
 }
 
-// Per-mode LED color (R, G, B at full brightness).
+// Per-mode LED color (R, G, B at full brightness), straight from the mode table.
 // BARRAGE uses rainbow (hue cycling), all others use a fixed color with breathing.
 static void get_mode_color(JammerMode mode, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    switch (mode) {
-        case MODE_STORM:            *r = 150; *g =   0; *b = 200; break; // purple
-        case MODE_BLE_ADV_BARRAGE:  *r =   0; *g = 200; *b = 200; break; // cyan
-        case MODE_TRACKING:         *r = 200; *g = 200; *b = 200; break; // white
-        case MODE_BT_CLASSIC:       *r =   0; *g =   0; *b = 200; break; // blue
-        case MODE_BLE_ALL:          *r =   0; *g = 200; *b =   0; break; // green
-        case MODE_BLE_ADV:          *r = 200; *g = 200; *b =   0; break; // yellow
-        case MODE_BLE_SIEGE:        *r = 200; *g = 100; *b =   0; break; // orange
-        case MODE_CONSTANT_CARRIER: *r = 200; *g =   0; *b =   0; break; // red
-        default:                    *r = 200; *g = 200; *b = 200; break; // white fallback
-    }
+    int idx = (int)mode;
+    if (idx < 0 || idx >= k_mode_count) idx = 0;
+    *r = k_modes[idx].r;
+    *g = k_modes[idx].g;
+    *b = k_modes[idx].b;
 }
 
 static void rainbow_led_task(void* arg)
@@ -453,6 +564,7 @@ static void wifi_jam_task(void* arg)
     static const uint8_t wifi_channels[] = { 1, 6, 11 };
     uint8_t ch_idx = 0;
     uint32_t pkt_count = 0;
+    uint32_t tx_errors = 0;
 
     for (;;) {
         if (!s_jamming_active) {
@@ -460,9 +572,17 @@ static void wifi_jam_task(void* arg)
             continue;
         }
 
-        esp_wifi_80211_tx(WIFI_IF_STA, s_beacon_frame, sizeof(s_beacon_frame), false);
+        esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, s_beacon_frame,
+                                           sizeof(s_beacon_frame), false);
+        if (err != ESP_OK) {
+            // Log the first failure and then every 100th one — the TX can fail
+            // transiently (e.g. while the channel switch is in flight).
+            if (++tx_errors == 1 || (tx_errors % 100) == 0)
+                LOG_ERR("WiFi raw TX failed (%s) — %lu error(s)",
+                        esp_err_to_name(err), (unsigned long)tx_errors);
+        }
 
-        if (++pkt_count >= 50) {
+        if (++pkt_count >= JAMMER_WIFI_FRAMES_PER_CH) {
             pkt_count = 0;
             ch_idx = (ch_idx + 1) % 3;
             esp_wifi_set_channel(wifi_channels[ch_idx], WIFI_SECOND_CHAN_NONE);
@@ -605,6 +725,7 @@ static void init_nrf24_modules(void)
         vTaskDelay(pdMS_TO_TICKS(100));
         LOG_RF1("OK | connected=%s", radio1.isChipConnected() ? "yes" : "no");
         module1_ok = true;
+        g_r1.present = true;
     } else {
         LOG_ERR("RF1 (HSPI) begin FAILED - check wiring CE=%d CSN=%d", CE_PIN_1, CSN_PIN_1);
         log_nrf24_spi_probe("RF1", spi0);
@@ -615,16 +736,22 @@ static void init_nrf24_modules(void)
         vTaskDelay(pdMS_TO_TICKS(100));
         LOG_RF2("OK | connected=%s", radio2.isChipConnected() ? "yes" : "no");
         module2_ok = true;
+        g_r2.present = true;
     } else {
         LOG_ERR("RF2 (VSPI) begin FAILED - check wiring CE=%d CSN=%d", CE_PIN_2, CSN_PIN_2);
         log_nrf24_spi_probe("RF2", spi1);
     }
 
     if (!module1_ok && !module2_ok) {
-        LOG_ERR("No NRF24 modules. Button/BLE still work.");
+        LOG_ERR("No NRF24 modules. Button/BLE/WiFi TX still work.");
         LOG_WRN("Hardware check: 3.3V on VCC, common GND, swap MISO/MOSI if probe is 0xFF/0x00; test module on a known-good Arduino+nRF24 sketch.");
         return;
     }
+
+    if (!module1_ok)
+        LOG_WRN("RF1 missing — running with radio 2 only.");
+    if (!module2_ok)
+        LOG_WRN("RF2 missing — running with radio 1 only.");
 
     // ---- RF self-test: each radio transmits CW, the other scans RPD ----
     // RPD triggers at >= -64 dBm. PA+LNA modules vary in output; a FAIL here
@@ -706,8 +833,8 @@ static void init_nrf24_modules(void)
                  radio2.isChipConnected() ? "connected" : "DISCONNECTED");
     }
 
-    if (module1_ok) configure_radio_for_tx(radio1);
-    if (module2_ok) configure_radio_for_tx(radio2);
+    if (module1_ok) jam_radio_configure(g_r1);
+    if (module2_ok) jam_radio_configure(g_r2);
 
     LOG_INIT("NRF24 CW: AutoAck=OFF PA=%d LNAbit=%d 2Mbps CRC=OFF PLL=%dus (override via JAMMER_NRF24_* in jammer_main.cpp)",
              (int)JAMMER_NRF24_PA_LEVEL, JAMMER_NRF24_PALEVEL_LNA_BIT, JAMMER_NRF24_PLL_SETTLE_US);
@@ -718,34 +845,50 @@ static void init_nrf24_modules(void)
     LOG_JAM("ON at boot (BARRAGE). Short-press=stop, long-press=change mode.");
 }
 
-static void configure_radio_for_tx(RF24& radio)
+// Put one radio into continuous-wave TX mode.
+static void jam_radio_configure(JamRadio& r)
 {
-    radio.powerUp();
+    if (!r.present) return;
+
+    r.radio->powerUp();
     vTaskDelay(pdMS_TO_TICKS(5));
-    radio.stopListening();
-    radio.setAutoAck(false);
-    radio.setRetries(0, 0);
-    radio.setPALevel(JAMMER_NRF24_PA_LEVEL, JAMMER_NRF24_PALEVEL_LNA_BIT != 0);
-    radio.setDataRate(RF24_2MBPS);
-    radio.setCRCLength(RF24_CRC_DISABLED);
-    radio.startConstCarrier(JAMMER_NRF24_PA_LEVEL, 45);
+    r.radio->stopListening();
+    r.radio->setAutoAck(false);
+    r.radio->setRetries(0, 0);
+    r.radio->setPALevel(JAMMER_NRF24_PA_LEVEL, JAMMER_NRF24_PALEVEL_LNA_BIT != 0);
+    r.radio->setDataRate(RF24_2MBPS);
+    r.radio->setCRCLength(RF24_CRC_DISABLED);
+    r.radio->startConstCarrier(JAMMER_NRF24_PA_LEVEL, 45);
+    r.ch_valid = false;  // the channel register was just rewritten
 }
 
 // CW hop: just retune the PLL. CE stays HIGH from startConstCarrier() so the
-// carrier never stops — 100% RF duty cycle. JAMMER_NRF24_PLL_SETTLE_US lets the PLL
-// lock on the new channel before we hop again.
-static void hop_carrier(RF24& radio, uint8_t channel)
+// carrier never stops — 100% RF duty cycle. JAMMER_NRF24_PLL_SETTLE_US lets the
+// PLL lock on the new channel before we hop again.
+static inline void jam_hop(JamRadio& r, uint8_t channel)
 {
-    radio.setChannel(channel);
+    if (!r.present) return;
+    if (r.ch_valid && r.last_ch == channel) return;  // already tuned there
+
+    r.radio->setChannel(channel);
+    r.last_ch = channel;
+    r.ch_valid = true;
+    (*r.hops)++;
     esp_rom_delay_us(JAMMER_NRF24_PLL_SETTLE_US);
 }
 
 // Fast hop: NO PLL dwell. The PLL starts retuning but never locks before the
 // next hop — the carrier continuously sweeps through intermediate frequencies,
-// creating broadband noise wider than the stable 2 kHz CW tone.
-static void hop_carrier_fast(RF24& radio, uint8_t channel)
+// creating broadband noise wider than the stable CW tone.
+static inline void jam_hop_fast(JamRadio& r, uint8_t channel)
 {
-    radio.setChannel(channel);
+    if (!r.present) return;
+    if (r.ch_valid && r.last_ch == channel) return;
+
+    r.radio->setChannel(channel);
+    r.last_ch = channel;
+    r.ch_valid = true;
+    (*r.hops)++;
 }
 
 static void jam_task(void* arg)
@@ -759,6 +902,7 @@ static void jam_task(void* arg)
         if (!s_jamming_active) {
             if (was_active) {
                 stop_jamming_radios();
+                log_session_stats();
                 LOG_JAM_OFF("Radios powered down");
                 was_active = false;
             }
@@ -770,17 +914,19 @@ static void jam_task(void* arg)
 
         if (!was_active || s_mode_changed) {
             s_mode_changed = false;
-            configure_radio_for_tx(radio1);
-            configure_radio_for_tx(radio2);
-            sweep_ch1 = 2;  sweep_ch2 = 41;
-            sweep_dir1 = true; sweep_dir2 = true;
+            jam_radio_configure(g_r1);
+            jam_radio_configure(g_r2);
+            sweep_idx1 = 0;
+            sweep_idx2 = (uint8_t)(BT_CLASSIC_CH_COUNT / 2);
+            sweep_dir1 = true; sweep_dir2 = false;
             ble_idx1 = 0; ble_idx2 = 20;
             ble_adv_idx = 0;
             tracking_cycle = 0;
             if (!was_active) {
+                s_jam_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
                 LOG_JAM("Radios active | R1=%s R2=%s",
-                        radio1.isChipConnected() ? "ok" : "FAIL",
-                        radio2.isChipConnected() ? "ok" : "FAIL");
+                        g_r1.present ? "ok" : "FAIL",
+                        g_r2.present ? "ok" : "FAIL");
             }
             was_active = true;
         }
@@ -800,8 +946,8 @@ static void jam_task(void* arg)
         if (++status_count >= 50000) {
             status_count = 0;
             LOG_JAM("Status: active | mode=%d R1=%s R2=%s", (int)currentMode,
-                    radio1.isChipConnected() ? "ok" : "FAIL",
-                    radio2.isChipConnected() ? "ok" : "FAIL");
+                    g_r1.present ? "ok" : "FAIL",
+                    g_r2.present ? "ok" : "FAIL");
         }
         if (++yield_count >= 200) {
             yield_count = 0;
@@ -815,89 +961,66 @@ static void jam_task(void* arg)
 // CW always on (100% RF duty cycle); hop rate scales inversely with PLL dwell.
 static void jam_barrage(void)
 {
-    hop_carrier(radio1, rand_channel());
-    hop_carrier(radio2, rand_channel());
+    jam_hop(g_r1, rand_channel());
+    jam_hop(g_r2, rand_channel());
 }
 
 // MODE 1: STORM — dual-strategy interference (scientifically optimized).
 // Radio 1 "NOISE": no PLL dwell → PLL continuously sweeps between channels,
 //   creating broadband noise wider than the 2 kHz stable CW tone. ~50k hops/s.
-// Radio 2 "STRIKE": PLL dwell (hop_carrier) → stable CW at channel center frequency,
+// Radio 2 "STRIKE": PLL dwell (jam_hop) → stable CW at channel center frequency,
 //   precise interference that corrupts GFSK demodulation. ~6600 hops/s.
 // Two complementary interference types that receivers can't optimize for both.
 static void jam_storm(void)
 {
-    hop_carrier_fast(radio1, rand_channel());
-    hop_carrier(radio2, rand_channel());
+    jam_hop_fast(g_r1, rand_channel());
+    jam_hop(g_r2, rand_channel());
 }
 
-// BLE advertising channels (shared by multiple modes)
-// ch37=2402→nRF ch2, ch38=2426→nRF ch26, ch39=2480→nRF ch80
-static const uint8_t ble_adv_channels[] = { 2, 26, 80 };
-
-// MODE 1: BLE ADV + BARRAGE — hybrid attack on both control and data planes.
+// MODE 2: BLE ADV + BARRAGE — hybrid attack on both control and data planes.
 // Radio 1 rapid-cycles the 3 BLE adv channels (same pattern that worked before).
 // Radio 2 does random barrage across all 80 channels — keeps AFH busy.
 static void jam_ble_adv_barrage(void)
 {
-    hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
-    ble_adv_idx = (ble_adv_idx + 1) % 3;
-    hop_carrier(radio2, rand_channel());
+    jam_hop(g_r1, ble_adv_channels[ble_adv_idx]);
+    ble_adv_idx = (ble_adv_idx + 1) % BLE_ADV_CH_COUNT;
+    jam_hop(g_r2, rand_channel());
 }
 
-// BT Classic: all 79 FHSS data channels (nRF24 ch 2-80)
-static const uint8_t bt_classic_channels[] = {
-     2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
-    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
-    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
-    50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
-    66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
-};
-#define BT_CLASSIC_CH_COUNT (sizeof(bt_classic_channels) / sizeof(bt_classic_channels[0]))
-
-// MODE 1: BT CLASSIC — CW sequential sweep ch 2-80 with PLL dwell per hop.
+// MODE 4: BT CLASSIC — CW sequential sweep ch 2-80 with PLL dwell per hop.
 // Radios sweep in opposite directions for max coverage.
 static void jam_bt_classic(void)
 {
-    hop_carrier(radio1, bt_classic_channels[sweep_ch1]);
-    hop_carrier(radio2, bt_classic_channels[sweep_ch2]);
+    jam_hop(g_r1, bt_classic_channels[sweep_idx1]);
+    jam_hop(g_r2, bt_classic_channels[sweep_idx2]);
 
-    if (sweep_dir1) { if (++sweep_ch1 >= BT_CLASSIC_CH_COUNT - 1) sweep_dir1 = false; }
-    else            { if (sweep_ch1 == 0) sweep_dir1 = true; else sweep_ch1--; }
+    if (sweep_dir1) { if (++sweep_idx1 >= BT_CLASSIC_CH_COUNT - 1) sweep_dir1 = false; }
+    else            { if (sweep_idx1 == 0) sweep_dir1 = true; else sweep_idx1--; }
 
-    if (sweep_dir2) { if (++sweep_ch2 >= BT_CLASSIC_CH_COUNT - 1) sweep_dir2 = false; }
-    else            { if (sweep_ch2 == 0) sweep_dir2 = true; else sweep_ch2--; }
+    if (sweep_dir2) { if (++sweep_idx2 >= BT_CLASSIC_CH_COUNT - 1) sweep_dir2 = false; }
+    else            { if (sweep_idx2 == 0) sweep_dir2 = true; else sweep_idx2--; }
 }
 
-// BLE: all 40 data + advertising channels (even nRF24 channels 2-80)
-static const uint8_t ble_all_channels[] = {
-     2,  4,  6,  8, 10, 12, 14, 16, 18, 20,
-    22, 24, 26, 28, 30, 32, 34, 36, 38, 40,
-    42, 44, 46, 48, 50, 52, 54, 56, 58, 60,
-    62, 64, 66, 68, 70, 72, 74, 76, 78, 80,
-};
-#define BLE_ALL_CH_COUNT (sizeof(ble_all_channels) / sizeof(ble_all_channels[0]))
-
-// MODE 2: BLE ALL — CW cycle through all 40 BLE channels, radios offset by 20
+// MODE 5: BLE ALL — CW cycle through all 40 BLE channels, radios offset by 20
 static void jam_ble_all(void)
 {
-    hop_carrier(radio1, ble_all_channels[ble_idx1]);
-    hop_carrier(radio2, ble_all_channels[ble_idx2]);
+    jam_hop(g_r1, ble_all_channels[ble_idx1]);
+    jam_hop(g_r2, ble_all_channels[ble_idx2]);
     ble_idx1 = (ble_idx1 + 1) % BLE_ALL_CH_COUNT;
     ble_idx2 = (ble_idx2 + 1) % BLE_ALL_CH_COUNT;
 }
 
-// MODE 4: BLE ADV — rapid-cycle both radios across the 3 BLE adv channels.
+// MODE 6: BLE ADV — rapid-cycle both radios across the 3 BLE adv channels.
 // Each radio hits a different channel per iteration, cycling fast.
 static void jam_ble_adv(void)
 {
-    hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
-    ble_adv_idx = (ble_adv_idx + 1) % 3;
-    hop_carrier(radio2, ble_adv_channels[ble_adv_idx]);
-    ble_adv_idx = (ble_adv_idx + 1) % 3;
+    jam_hop(g_r1, ble_adv_channels[ble_adv_idx]);
+    ble_adv_idx = (ble_adv_idx + 1) % BLE_ADV_CH_COUNT;
+    jam_hop(g_r2, ble_adv_channels[ble_adv_idx]);
+    ble_adv_idx = (ble_adv_idx + 1) % BLE_ADV_CH_COUNT;
 }
 
-// ---------- MODE: TRACKING — aggressive dual-vector attack ----------
+// ---------- MODE 3: TRACKING — aggressive dual-vector attack ----------
 // Both radios alternate between BLE adv channels and random barrage
 // in a 1:1 ratio. This doubles the BLE control-plane pressure compared
 // to ADV+BARRAGE (both radios hit adv channels, not just R1) while
@@ -906,67 +1029,43 @@ static void jam_ble_adv(void)
 static void jam_tracking(void)
 {
     if (tracking_cycle & 1) {
-        hop_carrier(radio1, rand_channel());
-        hop_carrier(radio2, ble_adv_channels[ble_adv_idx]);
-        ble_adv_idx = (ble_adv_idx + 1) % 3;
+        jam_hop(g_r1, rand_channel());
+        jam_hop(g_r2, ble_adv_channels[ble_adv_idx]);
+        ble_adv_idx = (ble_adv_idx + 1) % BLE_ADV_CH_COUNT;
     } else {
-        hop_carrier(radio1, ble_adv_channels[ble_adv_idx]);
-        ble_adv_idx = (ble_adv_idx + 1) % 3;
-        hop_carrier(radio2, rand_channel());
+        jam_hop(g_r1, ble_adv_channels[ble_adv_idx]);
+        ble_adv_idx = (ble_adv_idx + 1) % BLE_ADV_CH_COUNT;
+        jam_hop(g_r2, rand_channel());
     }
     tracking_cycle++;
 }
 
-// ---------- MODE: BLE SIEGE — attack ALL 40 BLE channels (data + adv) ----------
+// ---------- MODE 7: BLE SIEGE — attack ALL 40 BLE channels (data + adv) ----------
 // After pairing, BLE connections use DATA channels 0-36 (not advertising).
 // Barrage wastes half its hops on non-BLE frequencies (odd nRF24 channels).
 // BLE SIEGE focuses BOTH radios exclusively on the 40 BLE-specific frequencies,
 // doubling interference density on BLE vs barrage (2/40 = 5% vs 2/80 = 2.5%).
 // Targets: GATT control connection (data ch), reconnection (adv ch), discovery.
 // iPhone supervision timeout ~720ms / ~30ms interval = 24 events to disconnect.
-// All 40 BLE channels mapped to nRF24 channel numbers:
-static const uint8_t ble_siege_channels[] = {
-     2,                          // BLE adv ch37 (2402 MHz)
-     4,  6,  8, 10, 12, 14, 16, // BLE data ch0-6
-    18, 20, 22, 24,             // BLE data ch7-10
-    26,                          // BLE adv ch38 (2426 MHz)
-    28, 30, 32, 34, 36, 38, 40, // BLE data ch11-17
-    42, 44, 46, 48, 50, 52, 54, // BLE data ch18-24
-    56, 58, 60, 62, 64, 66, 68, // BLE data ch25-31
-    70, 72, 74, 76, 78,         // BLE data ch32-36
-    80,                          // BLE adv ch39 (2480 MHz)
-};
-#define BLE_SIEGE_CH_COUNT (sizeof(ble_siege_channels) / sizeof(ble_siege_channels[0]))
-
 static void jam_ble_siege(void)
 {
-    hop_carrier(radio1, ble_siege_channels[xorshift32() % BLE_SIEGE_CH_COUNT]);
-    hop_carrier(radio2, ble_siege_channels[xorshift32() % BLE_SIEGE_CH_COUNT]);
+    jam_hop(g_r1, ble_siege_channels[xorshift32() % BLE_SIEGE_CH_COUNT]);
+    jam_hop(g_r2, ble_siege_channels[xorshift32() % BLE_SIEGE_CH_COUNT]);
 }
 
-// MODE 7: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
+// MODE 8: CONSTANT CARRIER — CW on ch 45 (baseline / single-channel test)
 static void jam_constant_carrier(void)
 {
-    hop_carrier(radio1, 45);
-    hop_carrier(radio2, 45);
+    jam_hop(g_r1, 45);
+    jam_hop(g_r2, 45);
 }
 
 static void print_mode(void)
 {
-    const char* modeStr = "UNKNOWN";
-    switch (currentMode) {
-        case MODE_BARRAGE:          modeStr = "BARRAGE [rainbow] random hop all 80ch"; break;
-        case MODE_STORM:            modeStr = "STORM [purple] R1=noise sweep, R2=CW strike"; break;
-        case MODE_BLE_ADV_BARRAGE:  modeStr = "ADV+BARRAGE [cyan] R1=adv ctrl, R2=random"; break;
-        case MODE_TRACKING:         modeStr = "TRACKING [white] both radios alternate adv+barrage"; break;
-        case MODE_BT_CLASSIC:       modeStr = "BT CLASSIC [blue] sweep ch 2-80"; break;
-        case MODE_BLE_ALL:          modeStr = "BLE ALL [green] 40 BLE channels"; break;
-        case MODE_BLE_ADV:          modeStr = "BLE ADV [yellow] ch 2,26,80 rapid"; break;
-        case MODE_BLE_SIEGE:        modeStr = "BLE SIEGE [orange] all 40 BLE ch random (data+adv)"; break;
-        case MODE_CONSTANT_CARRIER: modeStr = "CONSTANT CARRIER [red] ch 45 test"; break;
-        default: break;
-    }
-    LOG_MODE("Current: %s", modeStr);
+    int idx = (int)currentMode;
+    if (idx < 0 || idx >= k_mode_count) idx = 0;
+    LOG_MODE("Current: %s [%s] %s", k_modes[idx].name, k_modes[idx].color,
+             k_modes[idx].detail);
 }
 
 static void switch_mode(void)

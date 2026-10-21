@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: jammer
+            path: .
+          - name: ble-scanner
+            path: tools/ble-scanner
+          - name: rf-interference-detector
+            path: tools/rf-interference-detector
+    steps:
+      - name: Checkout (RF24 submodule included)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up ESP-IDF v5.5
+        uses: espressif/idf@v5.5
+        with:
+          targets: esp32s3
+
+      - name: Set target
+        run: idf.py set-target esp32s3
+        working-directory: ${{ matrix.path }}
+
+      - name: Build
+        run: idf.py build
+        working-directory: ${{ matrix.path }}
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.name }}
+          path: ${{ matrix.path }}/build/*.bin
+          if-no-files-found: ignore

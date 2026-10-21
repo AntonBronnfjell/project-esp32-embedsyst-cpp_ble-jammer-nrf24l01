@@ -25,6 +25,5 @@ idf.py build flash monitor
 ```
 
 The RF24 component is shared from the repo root (`../../components/RF24`); see
-each tool's own `README.md` for wiring and tunables, and
-[`docs/github-readme-formatting.md`](../docs/github-readme-formatting.md) for the
-GitHub Markdown/HTML techniques these pages demonstrate.
+each tool's own `README.md` for wiring and tunables, and the
+[main README](../README.md) for the full system documentation.
