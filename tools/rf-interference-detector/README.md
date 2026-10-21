@@ -35,7 +35,8 @@ block of channels — and that contrast is what gets flagged.
 
 ```
 [sweep 42] 2.400 GHz _..:=*#%@@@%#*=:._..___...___..._.___ ... 2.525 GHz
-[ALERT] wideband interference signature: ch 10-34 saturated (19/126 hot, peak ch22 @ 96%, ~2422 MHz)
+[watch] wideband signature (1/3 sweeps): ch 10-34, peak ch22 @ 96%
+[ALERT] sustained wideband interference: ch 10-34 saturated for 3 sweeps (19/126 hot, peak ch22 @ 96%, ~2422 MHz)
 ```
 
 </div>
@@ -51,16 +52,22 @@ block of channels — and that contrast is what gets flagged.
 </table>
 
 The heuristic is deliberately simple and honest: if **≥18 of any 25 adjacent
-channels** read at or above the hot threshold in a single sweep, that is the
-wideband signature. Tune the constants at the top of
-[`main/detector_main.cpp`](main/detector_main.cpp):
+channels** read at or above the hot threshold, that is the wideband signature.
+To avoid false alarms, it's **debounced** — the signature must persist for
+`WIDEBAND_CONFIRM_SWEEPS` sweeps in a row before escalating from `[watch]` to
+`[ALERT]`. A transient burst clears before then. Tune the constants at the top
+of [`main/detector_main.cpp`](main/detector_main.cpp):
 
 | Constant | Default | Meaning |
 | --- | ---: | --- |
 | `SAMPLES_PER_CH` | `128` | RPD samples averaged per channel |
 | `HOT_THRESHOLD_PCT` | `50` | occupancy % at which a channel is "hot" |
 | `WIDEBAND_WINDOW` | `25` | sliding window width (channels) |
-| `WIDEBAND_HOT_IN_WIN` | `18` | hot channels in a window to raise an alert |
+| `WIDEBAND_HOT_IN_WIN` | `18` | hot channels in a window for the signature |
+| `WIDEBAND_CONFIRM_SWEEPS` | `3` | consecutive sweeps before `[watch]` → `[ALERT]` |
+
+**Severity states:** `[ok]` normal/bursty traffic · `[watch]` signature seen
+but not yet confirmed · `[ALERT]` sustained wideband interference.
 
 ## Wiring
 

@@ -58,6 +58,10 @@ static const char* TAG = "RFDET";
 // ordinary bursty traffic.
 #define WIDEBAND_WINDOW       25
 #define WIDEBAND_HOT_IN_WIN   18
+// Debounce: the wideband signature must persist this many sweeps in a row
+// before we raise an ALERT. Transient bursts (a brief Wi-Fi flood, a passing
+// device) clear before this count, so they're reported as "watch", not alert.
+#define WIDEBAND_CONFIRM_SWEEPS 3
 
 SPI spi0(SPI2_HOST);
 RF24 radio(CE_PIN, CSN_PIN);
@@ -134,12 +138,24 @@ static void print_sweep(uint32_t sweep_no)
 
     int win_start = 0;
     bool wideband = detect_wideband(occupancy, &win_start);
-    if (wideband) {
+
+    // Debounce: count consecutive sweeps carrying the signature, and only
+    // escalate to ALERT once it has persisted WIDEBAND_CONFIRM_SWEEPS times.
+    static uint32_t consec = 0;
+    consec = wideband ? consec + 1 : 0;
+
+    if (consec >= WIDEBAND_CONFIRM_SWEEPS) {
         ESP_LOGW(TAG, C_RED "[ALERT]" C_OFF
-                 " wideband interference signature: ch %d-%d saturated "
-                 "(%d/%d hot, peak ch%d @ %u%%, ~%u MHz)",
-                 win_start, win_start + WIDEBAND_WINDOW - 1, hot_total,
-                 NUM_CHANNELS, peak_ch, occupancy[peak_ch], 2400 + peak_ch);
+                 " sustained wideband interference: ch %d-%d saturated "
+                 "for %lu sweeps (%d/%d hot, peak ch%d @ %u%%, ~%u MHz)",
+                 win_start, win_start + WIDEBAND_WINDOW - 1,
+                 (unsigned long)consec, hot_total, NUM_CHANNELS, peak_ch,
+                 occupancy[peak_ch], 2400 + peak_ch);
+    } else if (wideband) {
+        ESP_LOGW(TAG, C_YEL "[watch]" C_OFF
+                 " wideband signature (%lu/%d sweeps): ch %d-%d, peak ch%d @ %u%%",
+                 (unsigned long)consec, WIDEBAND_CONFIRM_SWEEPS, win_start,
+                 win_start + WIDEBAND_WINDOW - 1, peak_ch, occupancy[peak_ch]);
     } else {
         ESP_LOGI(TAG, C_GRN "[ok]" C_OFF
                  " %d/%d channels busy, peak ch%d @ %u%% (~%u MHz)",
